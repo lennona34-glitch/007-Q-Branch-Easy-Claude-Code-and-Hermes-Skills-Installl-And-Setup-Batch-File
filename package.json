@@ -1,0 +1,28 @@
+{
+  "name": "007-qbranch",
+  "version": "1.0.0",
+  "description": "007 Q-Branch: Dual AI Agent Command Center for Claude Code & Nous Hermes Agent with 44 Bundled Combat Skills",
+  "main": "qbranch.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node qbranch.mjs",
+    "setup": "node qbranch.mjs setup",
+    "profiles": "node qbranch.mjs profiles",
+    "skills": "node qbranch.mjs skills",
+    "models": "node qbranch.mjs models",
+    "status": "node qbranch.mjs status"
+  },
+  "keywords": [
+    "claude-code",
+    "hermes-agent",
+    "ai-agents",
+    "autonomous-agents",
+    "bug-bounty",
+    "red-team",
+    "zero-cost",
+    "deepseek",
+    "gpt-6"
+  ],
+  "author": "Adrian",
+  "license": "MIT"
+}
