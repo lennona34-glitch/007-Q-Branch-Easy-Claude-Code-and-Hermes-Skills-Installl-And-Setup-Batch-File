@@ -23,6 +23,10 @@
     "deepseek",
     "gpt-6"
   ],
-  "author": "Adrian",
+  "author": "lennona34-glitch",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lennona34-glitch/007-Q-Branch-Easy-Claude-Code-and-Hermes-Skills-Installl-And-Setup-Batch-File.git"
+  },
   "license": "MIT"
 }

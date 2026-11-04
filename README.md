@@ -31,8 +31,8 @@
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/007-qbranch.git
-cd 007-qbranch
+git clone https://github.com/lennona34-glitch/007-Q-Branch-Easy-Claude-Code-and-Hermes-Skills-Installl-And-Setup-Batch-File.git
+cd 007-Q-Branch-Easy-Claude-Code-and-Hermes-Skills-Installl-And-Setup-Batch-File
 ```
 
 ### 2. Double-Click `Launch Agent.bat`
