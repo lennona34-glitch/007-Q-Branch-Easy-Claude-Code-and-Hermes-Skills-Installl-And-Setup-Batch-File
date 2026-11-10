@@ -44,9 +44,8 @@ if /i "%~1"=="pick" set "IS_CMD_ARG=1"
 :: If a file or folder was dragged onto this batch file
 if "!IS_CMD_ARG!"=="0" (
     if not "%~1"=="" (
-        if exist "%~1\" (
-            cd /d "%~1"
-        ) else if exist "%~1" (
+        if exist "%~1\" cd /d "%~1"
+        if not exist "%~1\" if exist "%~1" (
             cd /d "%~dp1"
             set "TARGET_FILE=%~nx1"
         )
@@ -71,27 +70,32 @@ if exist "%~dp0runtime\node\node.exe" (
     set "USB_ROOT=%~dp0"
     set "IS_PORTABLE=1"
     set "IS_DIRECT_USB=1"
-) else if exist "%~dp0..\runtime\node\node.exe" (
+)
+if exist "%~dp0..\runtime\node\node.exe" if not defined USB_ROOT (
     set "USB_ROOT=%~dp0..\"
     set "IS_PORTABLE=1"
     set "IS_DIRECT_USB=1"
 )
 
 :: Check B: Copied to host PC (Desktop/Project folder) -> Auto-detect plugged-in USB drive!
-if "!USB_ROOT!"=="" (
+if not defined USB_ROOT (
     for %%d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
-        if exist "%%d:\runtime\node\node.exe" (
-            set "USB_ROOT=%%d:\"
-            set "IS_PORTABLE=1"
-            set "IS_LINKED_USB=1"
-        ) else if exist "%%d:\Q-Branch-Portable\runtime\node\node.exe" (
-            set "USB_ROOT=%%d:\Q-Branch-Portable\"
-            set "IS_PORTABLE=1"
-            set "IS_LINKED_USB=1"
-        ) else if exist "%%d:\007-Q-Branch\runtime\node\node.exe" (
-            set "USB_ROOT=%%d:\007-Q-Branch\"
-            set "IS_PORTABLE=1"
-            set "IS_LINKED_USB=1"
+        if not defined USB_ROOT (
+            if exist "%%d:\runtime\node\node.exe" (
+                set "USB_ROOT=%%d:\"
+                set "IS_PORTABLE=1"
+                set "IS_LINKED_USB=1"
+            )
+            if exist "%%d:\Q-Branch-Portable\runtime\node\node.exe" (
+                set "USB_ROOT=%%d:\Q-Branch-Portable\"
+                set "IS_PORTABLE=1"
+                set "IS_LINKED_USB=1"
+            )
+            if exist "%%d:\007-Q-Branch\runtime\node\node.exe" (
+                set "USB_ROOT=%%d:\007-Q-Branch\"
+                set "IS_PORTABLE=1"
+                set "IS_LINKED_USB=1"
+            )
         )
     )
 )
@@ -150,18 +154,12 @@ echo %C_GOLD%     \___/ \___/  /_/     \__\_^|     ^|___/ ^|_^|_\/_/ \_\_^|\_\__
 echo %C_MAGENTA%                 AI AGENT COMMAND CENTER ^| LICENSE TO CODE               %C_RESET%
 echo %C_CYAN%==============================================================================%C_RESET%
 echo  %C_GRAY%OPERATIONAL FOLDER :%C_RESET% %C_WHITE%!CD!%C_RESET%
-if not "!TARGET_FILE!"=="" (
-    echo  %C_GRAY%TARGET FILE        :%C_RESET% %C_GOLD%!TARGET_FILE!%C_RESET%
-)
-if "!IS_DIRECT_USB!"=="1" (
-    echo  %C_GRAY%DEPLOYMENT MODE    :%C_RESET% %C_GREEN%[STANDALONE PORTABLE USB: !USB_ROOT!]%C_RESET%
-    echo  %C_GRAY%PRIVACY ISOLATION  :%C_RESET% %C_CYAN%100%% ISOLATED (Keys, history ^& cache stay on USB drive)%C_RESET%
-) else if "!IS_LINKED_USB!"=="1" (
-    echo  %C_GRAY%DEPLOYMENT MODE    :%C_RESET% %C_GREEN%[HOST PC LINKED TO USB ON !USB_ROOT!]%C_RESET%
-    echo  %C_GRAY%PRIVACY ISOLATION  :%C_RESET% %C_CYAN%100%% ISOLATED (Keys, history ^& cache stay on USB drive)%C_RESET%
-) else (
-    echo  %C_GRAY%DEPLOYMENT MODE    :%C_RESET% %C_GRAY%[LOCAL HOST ENVIRONMENT]%C_RESET%
-)
+if not "!TARGET_FILE!"=="" echo  %C_GRAY%TARGET FILE        :%C_RESET% %C_GOLD%!TARGET_FILE!%C_RESET%
+if "!IS_DIRECT_USB!"=="1" echo  %C_GRAY%DEPLOYMENT MODE    :%C_RESET% %C_GREEN%[STANDALONE PORTABLE USB: !USB_ROOT!]%C_RESET%
+if "!IS_DIRECT_USB!"=="1" echo  %C_GRAY%PRIVACY ISOLATION  :%C_RESET% %C_CYAN%100%% ISOLATED [Keys, history and cache stay on USB drive]%C_RESET%
+if "!IS_LINKED_USB!"=="1" echo  %C_GRAY%DEPLOYMENT MODE    :%C_RESET% %C_GREEN%[HOST PC LINKED TO USB ON !USB_ROOT!]%C_RESET%
+if "!IS_LINKED_USB!"=="1" echo  %C_GRAY%PRIVACY ISOLATION  :%C_RESET% %C_CYAN%100%% ISOLATED [Keys, history and cache stay on USB drive]%C_RESET%
+if "!IS_PORTABLE!"=="0"   echo  %C_GRAY%DEPLOYMENT MODE    :%C_RESET% %C_GRAY%[LOCAL HOST ENVIRONMENT]%C_RESET%
 echo  %C_GRAY%GATEWAY            :%C_RESET% %C_CYAN%Experiential Labs (Promotional Free Tier: $0)%C_RESET%
 echo  %C_GRAY%ACTIVE COMBINATION :%C_RESET% %C_GOLD%GPT-6 Luna%C_RESET% %C_GREEN%[FREE]%C_RESET% + %C_CYAN%DeepSeek Flash 1017%C_RESET% %C_GREEN%[FREE]%C_RESET%
 echo %C_CYAN%==============================================================================%C_RESET%
@@ -176,12 +174,9 @@ echo   %C_GOLD%[6]%C_RESET% %C_WHITE%Hermes Agent (YOLO)%C_RESET%%C_GRAY%- Auto-
 echo.
 echo  %C_CYAN%--- Q-BRANCH ARSENAL ^& NAVIGATION ---%C_RESET%
 echo   %C_CYAN%[W]%C_RESET% %C_WHITE%Select Target Folder/File%C_RESET% %C_GRAY%- Native Windows GUI Picker (or manual path)%C_RESET%
-if "!IS_PORTABLE!"=="1" (
-    echo   %C_GOLD%[U]%C_RESET% %C_WHITE%Update Portable Suite%C_RESET%   %C_GRAY%- In-place update of Claude, Hermes ^& Skills on USB%C_RESET%
-) else (
-    echo   %C_CYAN%[I]%C_RESET% %C_WHITE%First-Time Agent Setup%C_RESET%   %C_GRAY%- Check/Install Claude, Hermes, API Key ^& Skills%C_RESET%
-    echo   %C_GOLD%[U]%C_RESET% %C_WHITE%Portable USB Drive Builder%C_RESET%%C_GRAY%- Clone standalone agent suite, skills ^& keys to USB%C_RESET%
-)
+if "!IS_PORTABLE!"=="1" echo   %C_GOLD%[U]%C_RESET% %C_WHITE%Update Portable Suite%C_RESET%   %C_GRAY%- In-place update of Claude, Hermes ^& Skills on USB%C_RESET%
+if "!IS_PORTABLE!"=="0" echo   %C_CYAN%[I]%C_RESET% %C_WHITE%First-Time Agent Setup%C_RESET%   %C_GRAY%- Check/Install Claude, Hermes, API Key ^& Skills%C_RESET%
+if "!IS_PORTABLE!"=="0" echo   %C_GOLD%[U]%C_RESET% %C_WHITE%Portable USB Drive Builder%C_RESET%%C_GRAY%- Clone standalone agent suite, skills ^& keys to USB%C_RESET%
 echo   %C_MAGENTA%[P]%C_RESET% %C_WHITE%Mission Loadouts (Profiles)%C_RESET%%C_GRAY%- 1-Click Strike Team Swap (Special Ops / Restore)%C_RESET%
 echo   %C_MAGENTA%[K]%C_RESET% %C_WHITE%Skills Arsenal%C_RESET%            %C_GRAY%- Browse packs, search ^& deploy to project/globally%C_RESET%
 echo   %C_MAGENTA%[M]%C_RESET% %C_WHITE%Online Model Browser%C_RESET%       %C_GRAY%- Browse live gateway models, check Free tier ^& switch%C_RESET%
@@ -226,9 +221,7 @@ echo   %C_GREEN%[1]%C_RESET% %C_WHITE%Browse for Folder%C_RESET%        %C_GRAY%
 echo   %C_GREEN%[2]%C_RESET% %C_WHITE%Browse for File%C_RESET%          %C_GRAY%- Native Windows File Picker Dialog (GUI)%C_RESET%
 echo   %C_GREEN%[3]%C_RESET% %C_WHITE%Type or Paste Path%C_RESET%       %C_GRAY%- Manually enter directory or file path%C_RESET%
 echo   %C_GOLD%[4]%C_RESET% %C_WHITE%Current Desktop%C_RESET%          %C_GRAY%- Switch working directory to Desktop%C_RESET%
-if "!IS_PORTABLE!"=="1" (
-    echo   %C_GOLD%[5]%C_RESET% %C_WHITE%USB Sandbox Workspace%C_RESET%   %C_GRAY%- Switch to !USB_ROOT!data\sessions%C_RESET%
-)
+if "!IS_PORTABLE!"=="1" echo   %C_GOLD%[5]%C_RESET% %C_WHITE%USB Sandbox Workspace%C_RESET%   %C_GRAY%- Switch to !USB_ROOT!data\sessions%C_RESET%
 echo   %C_RED%[0]%C_RESET% %C_WHITE%Return to Main Menu%C_RESET%
 echo %C_CYAN%==============================================================================%C_RESET%
 set /p pchoice="%C_BOLD%Select action [1-5, 0]: %C_RESET%"
@@ -286,7 +279,9 @@ if exist "!mpath!\" (
     set "TARGET_FILE="
     echo %C_GREEN%✓ Operational folder set to: !mpath!%C_RESET%
     %SystemRoot%\system32\timeout.exe /t 1 >nul
-) else if exist "!mpath!" (
+    goto :menu
+)
+if exist "!mpath!" (
     for %%i in ("!mpath!") do (
         cd /d "%%~dpi"
         set "TARGET_FILE=%%~nxi"
@@ -294,10 +289,10 @@ if exist "!mpath!\" (
         echo %C_GOLD%✓ Target file locked: %%~nxi%C_RESET%
         %SystemRoot%\system32\timeout.exe /t 1 >nul
     )
-) else (
-    echo %C_RED%Path does not exist.%C_RESET%
-    %SystemRoot%\system32\timeout.exe /t 2 >nul
+    goto :menu
 )
+echo %C_RED%Path does not exist.%C_RESET%
+%SystemRoot%\system32\timeout.exe /t 2 >nul
 goto :menu
 
 :: ----------------------------------------------------------------------------
@@ -309,23 +304,23 @@ echo %C_GREEN%[*] Launching Claude Code in %CD%...%C_RESET%
 if not "!TARGET_FILE!"=="" echo %C_GOLD%[*] Targeting: !TARGET_FILE!%C_RESET%
 if "!IS_PORTABLE!"=="1" (
     if exist "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs" (
-        if not "!TARGET_FILE!"=="" (
-            node "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs" "!TARGET_FILE!"
-        ) else (
-            node "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs"
-        )
-    ) else if exist "%PORTABLE_NODE%\claude.cmd" (
+        if not "!TARGET_FILE!"=="" node "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs" "!TARGET_FILE!"
+        if "!TARGET_FILE!"=="" node "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs"
+        goto :session_ended
+    )
+    if exist "%PORTABLE_NODE%\claude.cmd" (
         call "%PORTABLE_NODE%\claude.cmd" !TARGET_FILE!
-    ) else (
-        call "%PORTABLE_NODE%\npx.cmd" @anthropic-ai/claude-code !TARGET_FILE!
+        goto :session_ended
     )
+    call "%PORTABLE_NODE%\npx.cmd" @anthropic-ai/claude-code !TARGET_FILE!
+    goto :session_ended
+)
+
+where claude >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+    claude !TARGET_FILE!
 ) else (
-    where claude >nul 2>nul
-    if %ERRORLEVEL% EQU 0 (
-        claude !TARGET_FILE!
-    ) else (
-        npx @anthropic-ai/claude-code !TARGET_FILE!
-    )
+    npx @anthropic-ai/claude-code !TARGET_FILE!
 )
 goto :session_ended
 
@@ -335,23 +330,23 @@ echo %C_GOLD%[*] Launching Claude Code (YOLO mode - skipping permission gates)..
 if not "!TARGET_FILE!"=="" echo %C_GOLD%[*] Targeting: !TARGET_FILE!%C_RESET%
 if "!IS_PORTABLE!"=="1" (
     if exist "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs" (
-        if not "!TARGET_FILE!"=="" (
-            node "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs" --dangerously-skip-permissions "!TARGET_FILE!"
-        ) else (
-            node "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs" --dangerously-skip-permissions
-        )
-    ) else if exist "%PORTABLE_NODE%\claude.cmd" (
+        if not "!TARGET_FILE!"=="" node "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs" --dangerously-skip-permissions "!TARGET_FILE!"
+        if "!TARGET_FILE!"=="" node "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs" --dangerously-skip-permissions
+        goto :session_ended
+    )
+    if exist "%PORTABLE_NODE%\claude.cmd" (
         call "%PORTABLE_NODE%\claude.cmd" --dangerously-skip-permissions !TARGET_FILE!
-    ) else (
-        call "%PORTABLE_NODE%\npx.cmd" @anthropic-ai/claude-code --dangerously-skip-permissions !TARGET_FILE!
+        goto :session_ended
     )
+    call "%PORTABLE_NODE%\npx.cmd" @anthropic-ai/claude-code --dangerously-skip-permissions !TARGET_FILE!
+    goto :session_ended
+)
+
+where claude >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+    claude --dangerously-skip-permissions !TARGET_FILE!
 ) else (
-    where claude >nul 2>nul
-    if %ERRORLEVEL% EQU 0 (
-        claude --dangerously-skip-permissions !TARGET_FILE!
-    ) else (
-        npx @anthropic-ai/claude-code --dangerously-skip-permissions !TARGET_FILE!
-    )
+    npx @anthropic-ai/claude-code --dangerously-skip-permissions !TARGET_FILE!
 )
 goto :session_ended
 
