@@ -22,6 +22,8 @@
 * **44 Bundled Combat Skills:** Shipped directly with the repository—**zero file hunting or external downloads**. Offensive security, bug bounty hunting, binary reversing, and autonomous multi-agent loops.
 * **Dual Runtime Architecture:** Seamlessly bridges **Claude Code** on Windows with **Nous Hermes Agent** inside WSL (Kali Linux / Ubuntu).
 * **Built-in First-Time Setup Wizard (`[I]`):** Automatically verifies Node.js, Claude Code CLI, WSL2, Hermes Agent, and configures API credentials across both agents.
+* **Native GUI Target Picker (`[W]`):** Built-in native Windows folder and file browser dialogs—browse and lock onto any project folder or specific target file on the host machine with one click.
+* **Smart USB Auto-Link & Drag-and-Drop:** Drag and drop any folder or file onto `Launch Agent.bat` in File Explorer. Or copy `Launch Agent.bat` anywhere on a host PC: it automatically discovers the plugged-in USB drive, links to its portable runtimes, and operates while keeping all keys, history, and cache 100% isolated to the USB drive!
 * **Portable USB Drive Builder (`[U]`):** Clone your entire agent setup (portable Node.js runtime, Claude Code CLI, Hermes Agent, API keys, and 44 combat skills) directly to a USB flash drive. Plug it into **ANY** Windows machine—no host software required—with complete privacy and self-updating capability.
 * **Live Online Model Browser (`[M]`):** Queries active gateway models, separates free promotional tiers from Pro models, and updates both agents with 1 click.
 * **1-Click Mission Loadouts (`[P]`):** Hot-swap between Special Ops, pure Bug Bounty, Autonomous Swarms, or restore your factory baseline instantly.
@@ -65,7 +67,8 @@ ACTIVE COMBINATION : GPT-6 Luna [FREE] + DeepSeek Flash 1017 [FREE]
   [5] Claude Code (YOLO) - Bypass Permission Prompts
   [6] Hermes Agent (YOLO)- Auto-Approve Command Execution
 
-  --- Q-BRANCH ARSENAL & INTELLIGENCE ---
+  --- Q-BRANCH ARSENAL & NAVIGATION ---
+  [W] Select Target Folder/File- Native Windows GUI Picker (or manual path)
   [I] First-Time Agent Setup   - Check/Install Claude, Hermes, API Key & Skills
   [U] Portable USB Builder     - Clone standalone suite, skills & keys to USB stick
   [P] Mission Loadouts         - 1-Click Strike Team Swap (Special Ops / Restore)
