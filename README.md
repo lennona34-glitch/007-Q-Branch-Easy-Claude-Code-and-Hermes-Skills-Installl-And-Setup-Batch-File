@@ -22,6 +22,7 @@
 * **44 Bundled Combat Skills:** Shipped directly with the repository—**zero file hunting or external downloads**. Offensive security, bug bounty hunting, binary reversing, and autonomous multi-agent loops.
 * **Dual Runtime Architecture:** Seamlessly bridges **Claude Code** on Windows with **Nous Hermes Agent** inside WSL (Kali Linux / Ubuntu).
 * **Built-in First-Time Setup Wizard (`[I]`):** Automatically verifies Node.js, Claude Code CLI, WSL2, Hermes Agent, and configures API credentials across both agents.
+* **Portable USB Drive Builder (`[U]`):** Clone your entire agent setup (portable Node.js runtime, Claude Code CLI, Hermes Agent, API keys, and 44 combat skills) directly to a USB flash drive. Plug it into **ANY** Windows machine—no host software required—with complete privacy and self-updating capability.
 * **Live Online Model Browser (`[M]`):** Queries active gateway models, separates free promotional tiers from Pro models, and updates both agents with 1 click.
 * **1-Click Mission Loadouts (`[P]`):** Hot-swap between Special Ops, pure Bug Bounty, Autonomous Swarms, or restore your factory baseline instantly.
 
@@ -66,6 +67,7 @@ ACTIVE COMBINATION : GPT-6 Luna [FREE] + DeepSeek Flash 1017 [FREE]
 
   --- Q-BRANCH ARSENAL & INTELLIGENCE ---
   [I] First-Time Agent Setup   - Check/Install Claude, Hermes, API Key & Skills
+  [U] Portable USB Builder     - Clone standalone suite, skills & keys to USB stick
   [P] Mission Loadouts         - 1-Click Strike Team Swap (Special Ops / Restore)
   [K] Skills Arsenal           - Browse packs, search & deploy to project/globally
   [M] Online Model Browser     - Browse live gateway models, check Free tier & switch
