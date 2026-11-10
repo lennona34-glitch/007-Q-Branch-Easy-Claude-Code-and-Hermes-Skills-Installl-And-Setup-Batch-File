@@ -58,14 +58,14 @@ if not defined TARGET_FILE (
 )
 
 :: ----------------------------------------------------------------------------
-:: 2. Smart USB Auto-Detection (Direct USB or Copied to Host PC)
+:: 2. Smart USB & Environment Detection
 :: ----------------------------------------------------------------------------
 set "USB_ROOT="
 set "IS_PORTABLE=0"
 set "IS_DIRECT_USB=0"
 set "IS_LINKED_USB=0"
 
-:: Check A: Running directly from the USB drive root
+:: Check A: Running directly from the USB drive
 if exist "%~dp0runtime\node\node.exe" (
     set "USB_ROOT=%~dp0"
     set "IS_PORTABLE=1"
@@ -77,33 +77,41 @@ if exist "%~dp0..\runtime\node\node.exe" if not defined USB_ROOT (
     set "IS_DIRECT_USB=1"
 )
 
-:: Check B: Copied to host PC (Desktop/Project folder) -> Auto-detect plugged-in USB drive!
-if not defined USB_ROOT (
-    for %%d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
-        if not defined USB_ROOT (
-            if exist "%%d:\runtime\node\node.exe" (
-                set "USB_ROOT=%%d:\"
-                set "IS_PORTABLE=1"
-                set "IS_LINKED_USB=1"
-            )
-            if exist "%%d:\Q-Branch-Portable\runtime\node\node.exe" (
-                set "USB_ROOT=%%d:\Q-Branch-Portable\"
-                set "IS_PORTABLE=1"
-                set "IS_LINKED_USB=1"
-            )
-            if exist "%%d:\007-Q-Branch\runtime\node\node.exe" (
-                set "USB_ROOT=%%d:\007-Q-Branch\"
-                set "IS_PORTABLE=1"
-                set "IS_LINKED_USB=1"
-            )
-        )
+:: Check B: Detect plugged-in USB drive (D: through Z:)
+set "FOUND_USB="
+for %%d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
+    if not defined FOUND_USB (
+        if exist "%%d:\runtime\node\node.exe" set "FOUND_USB=%%d:\"
+        if exist "%%d:\Q-Branch-Portable\runtime\node\node.exe" set "FOUND_USB=%%d:\Q-Branch-Portable\"
+        if exist "%%d:\007-Q-Branch\runtime\node\node.exe" set "FOUND_USB=%%d:\007-Q-Branch\"
     )
 )
 
-:: Configure Environment based on Detection
+:: If running on Host PC (not directly on USB):
+if "!IS_DIRECT_USB!"=="0" (
+    :: Check if host PC has working tools installed
+    set "HOST_HAS_TOOLS=0"
+    where claude >nul 2>nul
+    if !ERRORLEVEL! EQU 0 set "HOST_HAS_TOOLS=1"
+    where node >nul 2>nul
+    if !ERRORLEVEL! EQU 0 set "HOST_HAS_TOOLS=1"
+
+    :: On a foreign PC with NO tools installed: link to USB runtime automatically
+    if "!HOST_HAS_TOOLS!"=="0" if defined FOUND_USB (
+        set "USB_ROOT=!FOUND_USB!"
+        set "IS_PORTABLE=1"
+        set "IS_LINKED_USB=1"
+    )
+    :: On Adrian's PC with native tools: keep Host Mode as primary, link USB for syncing
+    if "!HOST_HAS_TOOLS!"=="1" if defined FOUND_USB (
+        set "USB_ROOT=!FOUND_USB!"
+        set "IS_LINKED_USB=1"
+    )
+)
+
+:: Configure Environment
 if "!IS_PORTABLE!"=="1" (
     set "PORTABLE_NODE=!USB_ROOT!runtime\node"
-    set "PORTABLE_CLAUDE=!USB_ROOT!runtime\claude"
     set "PORTABLE_HERMES=!USB_ROOT!runtime\hermes"
     set "PATH=!PORTABLE_NODE!;!PORTABLE_HERMES!;%SystemRoot%\system32;%SystemRoot%;%PATH%"
     set "USERPROFILE=!USB_ROOT!data\home"
@@ -115,9 +123,11 @@ if "!IS_PORTABLE!"=="1" (
     set "CLAUDE_CODE_AUTO_MODE_SERVER=0"
     set "QBRANCH_SCRIPT=!USB_ROOT!qbranch.mjs"
 ) else (
-    set "PATH=%SystemRoot%\system32;%SystemRoot%;C:\Program Files\nodejs;C:\Program Files\Git\cmd;%PATH%"
+    set "PATH=%SystemRoot%\system32;%SystemRoot%;C:\Program Files\nodejs;C:\Program Files\Git\cmd;%LOCALAPPDATA%\Programs\Python\Python312;%PATH%"
     if exist "%~dp0qbranch.mjs" (
         set "QBRANCH_SCRIPT=%~dp0qbranch.mjs"
+    ) else if defined USB_ROOT (
+        set "QBRANCH_SCRIPT=!USB_ROOT!qbranch.mjs"
     ) else (
         set "QBRANCH_SCRIPT=%USERPROFILE%\.claude\qbranch.mjs"
     )
@@ -157,9 +167,9 @@ echo  %C_GRAY%OPERATIONAL FOLDER :%C_RESET% %C_WHITE%!CD!%C_RESET%
 if not "!TARGET_FILE!"=="" echo  %C_GRAY%TARGET FILE        :%C_RESET% %C_GOLD%!TARGET_FILE!%C_RESET%
 if "!IS_DIRECT_USB!"=="1" echo  %C_GRAY%DEPLOYMENT MODE    :%C_RESET% %C_GREEN%[STANDALONE PORTABLE USB: !USB_ROOT!]%C_RESET%
 if "!IS_DIRECT_USB!"=="1" echo  %C_GRAY%PRIVACY ISOLATION  :%C_RESET% %C_CYAN%100%% ISOLATED [Keys, history and cache stay on USB drive]%C_RESET%
-if "!IS_LINKED_USB!"=="1" echo  %C_GRAY%DEPLOYMENT MODE    :%C_RESET% %C_GREEN%[HOST PC LINKED TO USB ON !USB_ROOT!]%C_RESET%
-if "!IS_LINKED_USB!"=="1" echo  %C_GRAY%PRIVACY ISOLATION  :%C_RESET% %C_CYAN%100%% ISOLATED [Keys, history and cache stay on USB drive]%C_RESET%
-if "!IS_PORTABLE!"=="0"   echo  %C_GRAY%DEPLOYMENT MODE    :%C_RESET% %C_GRAY%[LOCAL HOST ENVIRONMENT]%C_RESET%
+if "!IS_PORTABLE!"=="1" if "!IS_DIRECT_USB!"=="0" echo  %C_GRAY%DEPLOYMENT MODE    :%C_RESET% %C_GREEN%[HOST LINKED TO PORTABLE USB: !USB_ROOT!]%C_RESET%
+if "!IS_PORTABLE!"=="0"   echo  %C_GRAY%DEPLOYMENT MODE    :%C_RESET% %C_GREEN%[LOCAL HOST ENVIRONMENT (KALI WSL + HOST TOOLS)]%C_RESET%
+if "!IS_PORTABLE!"=="0" if defined USB_ROOT echo  %C_GRAY%USB SUITE ATTACHED :%C_RESET% %C_GOLD%!USB_ROOT! [Ready for sync or backup]%C_RESET%
 echo  %C_GRAY%GATEWAY            :%C_RESET% %C_CYAN%Experiential Labs (Promotional Free Tier: $0)%C_RESET%
 echo  %C_GRAY%ACTIVE COMBINATION :%C_RESET% %C_GOLD%GPT-6 Luna%C_RESET% %C_GREEN%[FREE]%C_RESET% + %C_CYAN%DeepSeek Flash 1017%C_RESET% %C_GREEN%[FREE]%C_RESET%
 echo %C_CYAN%==============================================================================%C_RESET%
@@ -299,116 +309,91 @@ goto :menu
 :: Agent Execution Routines
 :: ----------------------------------------------------------------------------
 :run_claude
+set "CLAUDE_FLAGS="
+goto :exec_claude
+
+:run_claude_yolo
+set "CLAUDE_FLAGS=--dangerously-skip-permissions"
+goto :exec_claude
+
+:exec_claude
 echo.
 echo %C_GREEN%[*] Launching Claude Code in %CD%...%C_RESET%
 if not "!TARGET_FILE!"=="" echo %C_GOLD%[*] Targeting: !TARGET_FILE!%C_RESET%
+
+:: Priority 1 (Portable Standalone): Run portable Claude on USB
 if "!IS_PORTABLE!"=="1" (
-    if exist "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs" (
-        if not "!TARGET_FILE!"=="" node "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs" "!TARGET_FILE!"
-        if "!TARGET_FILE!"=="" node "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs"
+    if exist "%PORTABLE_NODE%\node_modules\@anthropic-ai\claude-code\cli-wrapper.cjs" (
+        node "%PORTABLE_NODE%\node_modules\@anthropic-ai\claude-code\cli-wrapper.cjs" %CLAUDE_FLAGS% !TARGET_FILE!
         goto :session_ended
     )
     if exist "%PORTABLE_NODE%\claude.cmd" (
-        call "%PORTABLE_NODE%\claude.cmd" !TARGET_FILE!
+        call "%PORTABLE_NODE%\claude.cmd" %CLAUDE_FLAGS% !TARGET_FILE!
         goto :session_ended
     )
-    call "%PORTABLE_NODE%\npx.cmd" @anthropic-ai/claude-code !TARGET_FILE!
+)
+
+:: Priority 2 (Host PC): Run host native claude
+where claude >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+    claude %CLAUDE_FLAGS% !TARGET_FILE!
     goto :session_ended
 )
 
-where claude >nul 2>nul
-if %ERRORLEVEL% EQU 0 (
-    claude !TARGET_FILE!
-) else (
-    npx @anthropic-ai/claude-code !TARGET_FILE!
-)
+:: Priority 3: Fall back to npx
+npx @anthropic-ai/claude-code %CLAUDE_FLAGS% !TARGET_FILE!
 goto :session_ended
 
-:run_claude_yolo
-echo.
-echo %C_GOLD%[*] Launching Claude Code (YOLO mode - skipping permission gates)...%C_RESET%
-if not "!TARGET_FILE!"=="" echo %C_GOLD%[*] Targeting: !TARGET_FILE!%C_RESET%
-if "!IS_PORTABLE!"=="1" (
-    if exist "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs" (
-        if not "!TARGET_FILE!"=="" node "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs" --dangerously-skip-permissions "!TARGET_FILE!"
-        if "!TARGET_FILE!"=="" node "%PORTABLE_CLAUDE%\node_modules\@anthropic-ai\claude-code\cli.mjs" --dangerously-skip-permissions
-        goto :session_ended
-    )
-    if exist "%PORTABLE_NODE%\claude.cmd" (
-        call "%PORTABLE_NODE%\claude.cmd" --dangerously-skip-permissions !TARGET_FILE!
-        goto :session_ended
-    )
-    call "%PORTABLE_NODE%\npx.cmd" @anthropic-ai/claude-code --dangerously-skip-permissions !TARGET_FILE!
-    goto :session_ended
-)
-
-where claude >nul 2>nul
-if %ERRORLEVEL% EQU 0 (
-    claude --dangerously-skip-permissions !TARGET_FILE!
-) else (
-    npx @anthropic-ai/claude-code --dangerously-skip-permissions !TARGET_FILE!
-)
-goto :session_ended
 
 :run_hermes_luna
-echo.
-echo %C_GREEN%[*] Launching Hermes Agent (GPT-6 Luna) in %CD%...%C_RESET%
-if "!IS_PORTABLE!"=="1" (
-    where wsl >nul 2>nul
-    if %ERRORLEVEL% EQU 0 (
-        wsl --cd "%CD%" bash -lic "hermes -m gpt-6-luna"
-    ) else (
-        "%PORTABLE_HERMES%\uv.exe" tool run hermes-agent -m gpt-6-luna
-    )
-) else (
-    wsl -d kali-linux --cd "%CD%" -u Ade bash -lic "hermes -m gpt-6-luna"
-)
-goto :session_ended
+set "HERMES_ARGS=-m gpt-6-luna"
+goto :exec_hermes
 
 :run_hermes_tui
-echo.
-echo %C_GREEN%[*] Launching Hermes Agent in Modern Visual TUI mode...%C_RESET%
-if "!IS_PORTABLE!"=="1" (
-    where wsl >nul 2>nul
-    if %ERRORLEVEL% EQU 0 (
-        wsl --cd "%CD%" bash -lic "hermes --tui -m gpt-6-luna"
-    ) else (
-        "%PORTABLE_HERMES%\uv.exe" tool run hermes-agent --tui -m gpt-6-luna
-    )
-) else (
-    wsl -d kali-linux --cd "%CD%" -u Ade bash -lic "hermes --tui -m gpt-6-luna"
-)
-goto :session_ended
+set "HERMES_ARGS=--tui -m gpt-6-luna"
+goto :exec_hermes
 
 :run_hermes_deepseek
-echo.
-echo %C_GREEN%[*] Launching Hermes Agent (DeepSeek V4.1 Flash 1017) in %CD%...%C_RESET%
-if "!IS_PORTABLE!"=="1" (
-    where wsl >nul 2>nul
-    if %ERRORLEVEL% EQU 0 (
-        wsl --cd "%CD%" bash -lic "hermes -m deepseek-v4.1-flash-1017"
-    ) else (
-        "%PORTABLE_HERMES%\uv.exe" tool run hermes-agent -m deepseek-v4.1-flash-1017
-    )
-) else (
-    wsl -d kali-linux --cd "%CD%" -u Ade bash -lic "hermes -m deepseek-v4.1-flash-1017"
-)
-goto :session_ended
+set "HERMES_ARGS=-m deepseek-v4.1-flash-1017"
+goto :exec_hermes
 
 :run_hermes_yolo
+set "HERMES_ARGS=--yolo"
+goto :exec_hermes
+
+:exec_hermes
 echo.
-echo %C_GOLD%[*] Launching Hermes Agent (YOLO mode - auto-approving tool actions)...%C_RESET%
-if "!IS_PORTABLE!"=="1" (
-    where wsl >nul 2>nul
-    if %ERRORLEVEL% EQU 0 (
-        wsl --cd "%CD%" bash -lic "hermes --yolo"
-    ) else (
-        "%PORTABLE_HERMES%\uv.exe" tool run hermes-agent --yolo
-    )
-) else (
-    wsl -d kali-linux --cd "%CD%" -u Ade bash -lic "hermes --yolo"
+echo %C_GREEN%[*] Launching Hermes Agent (%HERMES_ARGS%) in %CD%...%C_RESET%
+
+:: Priority 1: WSL Kali Linux (where the full 63-plugin Nous Research Hermes lives)
+wsl -d kali-linux -u Ade bash -c "which hermes >/dev/null 2>&1" >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+    wsl -d kali-linux --cd "%CD%" -u Ade bash -lic "hermes %HERMES_ARGS%"
+    goto :session_ended
 )
+
+:: Priority 2: Default WSL Distro
+where wsl >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+    wsl bash -c "which hermes >/dev/null 2>&1" >nul 2>nul
+    if %ERRORLEVEL% EQU 0 (
+        wsl --cd "%CD%" bash -lic "hermes %HERMES_ARGS%"
+        goto :session_ended
+    )
+)
+
+:: Priority 3: Native Windows Hermes (if installed)
+where hermes >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+    hermes %HERMES_ARGS%
+    goto :session_ended
+)
+
+echo.
+echo %C_RED%[!] Hermes Agent could not be located in WSL (kali-linux) or on Windows.%C_RESET%
+echo %C_GRAY%Please ensure Hermes is installed in WSL (kali-linux) or run Setup [I].%C_RESET%
 goto :session_ended
+
 
 :run_setup
 echo.
