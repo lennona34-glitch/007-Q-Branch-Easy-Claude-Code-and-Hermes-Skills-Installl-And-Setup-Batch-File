@@ -366,18 +366,18 @@ echo.
 echo %C_GREEN%[*] Launching Hermes Agent (%HERMES_ARGS%) in %CD%...%C_RESET%
 
 :: Priority 1: WSL Kali Linux (where the full 63-plugin Nous Research Hermes lives)
-wsl -d kali-linux -u Ade bash -c "which hermes >/dev/null 2>&1" >nul 2>nul
+wsl.exe -d kali-linux -u Ade test -f /home/Ade/.local/bin/hermes >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    wsl -d kali-linux --cd "%CD%" -u Ade bash -lic "hermes %HERMES_ARGS%"
+    wsl.exe -d kali-linux -u Ade --cd "%CD%" bash -lic "hermes %HERMES_ARGS%"
     goto :session_ended
 )
 
 :: Priority 2: Default WSL Distro
-where wsl >nul 2>nul
+where wsl.exe >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-    wsl bash -c "which hermes >/dev/null 2>&1" >nul 2>nul
+    wsl.exe test -f /home/Ade/.local/bin/hermes >nul 2>nul
     if %ERRORLEVEL% EQU 0 (
-        wsl --cd "%CD%" bash -lic "hermes %HERMES_ARGS%"
+        wsl.exe -u Ade --cd "%CD%" bash -lic "hermes %HERMES_ARGS%"
         goto :session_ended
     )
 )
