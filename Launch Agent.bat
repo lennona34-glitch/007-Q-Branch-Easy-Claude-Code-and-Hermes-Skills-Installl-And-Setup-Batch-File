@@ -116,6 +116,9 @@ if "!IS_PORTABLE!"=="1" (
     set "PATH=!PORTABLE_NODE!;!PORTABLE_HERMES!;%SystemRoot%\system32;%SystemRoot%;%PATH%"
     set "USERPROFILE=!USB_ROOT!data\home"
     set "HOME=!USB_ROOT!data\home"
+    if not exist "!USERPROFILE!\Desktop" mkdir "!USERPROFILE!\Desktop" >nul 2>nul
+    if not exist "!USERPROFILE!\Documents" mkdir "!USERPROFILE!\Documents" >nul 2>nul
+    if not exist "!USERPROFILE!\Downloads" mkdir "!USERPROFILE!\Downloads" >nul 2>nul
     set "CLAUDE_CONFIG_DIR=!USB_ROOT!config\claude"
     set "HERMES_HOME=!USB_ROOT!config\hermes"
     set "ANTHROPIC_BASE_URL=https://api.experientiallabs.ai"
@@ -256,11 +259,11 @@ goto :menu
 :gui_pick_folder
 echo.
 echo %C_CYAN%[*] Opening Windows Folder Browser Dialog...%C_RESET%
-for /f "usebackq delims=" %%f in (`powershell -Sta -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = '007 Q-Branch: Select Operational Folder for AI Agents'; if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }"`) do (
+for /f "usebackq delims=" %%f in (`powershell -Sta -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = '007 Q-Branch: Select Operational Folder for AI Agents'; $f.SelectedPath = (Get-Location).Path; $f.ShowNewFolderButton = $true; if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.SelectedPath }"`) do (
     if exist "%%f" (
         cd /d "%%f"
         set "TARGET_FILE="
-        echo %C_GREEN%✓ Operational folder set to: %%f%C_RESET%
+        echo %C_GREEN%[+] Operational folder set to: %%f%C_RESET%
         %SystemRoot%\system32\timeout.exe /t 1 >nul
     )
 )
@@ -269,12 +272,12 @@ goto :menu
 :gui_pick_file
 echo.
 echo %C_CYAN%[*] Opening Windows File Picker Dialog...%C_RESET%
-for /f "usebackq delims=" %%f in (`powershell -Sta -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog; $f.Title = '007 Q-Branch: Select Target File'; if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.FileName }"`) do (
+for /f "usebackq delims=" %%f in (`powershell -Sta -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog; $f.Title = '007 Q-Branch: Select Target File'; $f.InitialDirectory = (Get-Location).Path; $f.RestoreDirectory = $true; if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $f.FileName }"`) do (
     if exist "%%f" (
         cd /d "%%~dpf"
         set "TARGET_FILE=%%~nxf"
-        echo %C_GREEN%✓ Operational folder set to: %%~dpf%C_RESET%
-        echo %C_GOLD%✓ Target file locked: %%~nxf%C_RESET%
+        echo %C_GREEN%[+] Operational folder set to: %%~dpf%C_RESET%
+        echo %C_GOLD%[+] Target file locked: %%~nxf%C_RESET%
         %SystemRoot%\system32\timeout.exe /t 1 >nul
     )
 )
@@ -287,7 +290,7 @@ set "mpath=!mpath:"=!"
 if exist "!mpath!\" (
     cd /d "!mpath!"
     set "TARGET_FILE="
-    echo %C_GREEN%✓ Operational folder set to: !mpath!%C_RESET%
+    echo %C_GREEN%[+] Operational folder set to: !mpath!%C_RESET%
     %SystemRoot%\system32\timeout.exe /t 1 >nul
     goto :menu
 )
@@ -295,8 +298,8 @@ if exist "!mpath!" (
     for %%i in ("!mpath!") do (
         cd /d "%%~dpi"
         set "TARGET_FILE=%%~nxi"
-        echo %C_GREEN%✓ Operational folder set to: %%~dpi%C_RESET%
-        echo %C_GOLD%✓ Target file locked: %%~nxi%C_RESET%
+        echo %C_GREEN%[+] Operational folder set to: %%~dpi%C_RESET%
+        echo %C_GOLD%[+] Target file locked: %%~nxi%C_RESET%
         %SystemRoot%\system32\timeout.exe /t 1 >nul
     )
     goto :menu
