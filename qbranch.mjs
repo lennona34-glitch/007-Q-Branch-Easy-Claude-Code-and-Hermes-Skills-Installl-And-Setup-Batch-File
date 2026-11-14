@@ -81,18 +81,28 @@ function runWsl(bashCmd, options = {}) {
   }
 }
 
+const CLAUDE_ACTIVE_SETTINGS_PATH = process.env.CLAUDE_CONFIG_DIR
+  ? path.join(process.env.CLAUDE_CONFIG_DIR, 'settings.json')
+  : CLAUDE_SETTINGS_PATH;
+
 function readClaudeSettings() {
-  try {
-    if (fs.existsSync(CLAUDE_SETTINGS_PATH)) {
-      return JSON.parse(fs.readFileSync(CLAUDE_SETTINGS_PATH, 'utf8'));
-    }
-  } catch (e) {}
+  for (const p of [CLAUDE_ACTIVE_SETTINGS_PATH, CLAUDE_SETTINGS_PATH]) {
+    try {
+      if (fs.existsSync(p)) {
+        return JSON.parse(fs.readFileSync(p, 'utf8'));
+      }
+    } catch (e) {}
+  }
   return { env: {}, permissions: {}, modelSettings: {} };
 }
 
 function saveClaudeSettings(settings) {
-  fs.mkdirSync(path.dirname(CLAUDE_SETTINGS_PATH), { recursive: true });
-  fs.writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2), 'utf8');
+  const payload = JSON.stringify(settings, null, 2);
+  const targets = new Set([CLAUDE_SETTINGS_PATH, CLAUDE_ACTIVE_SETTINGS_PATH]);
+  for (const p of targets) {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, payload, 'utf8');
+  }
 }
 
 function syncToHermes(primaryModel, baseUrl, apiKey) {
@@ -468,6 +478,181 @@ async function configureApi() {
   console.log(`${C.green}✓ Saved and synchronized across Claude Code & Hermes!${C.reset}\n`);
 }
 
+function fmtUsd(v) {
+  if (v == null || Number.isNaN(v)) return '?';
+  if (v === 0) return '$0';
+  if (v >= 1 && Number.isInteger(v)) return `$${v}`;
+  if (v >= 0.01) {
+    const s3 = v.toFixed(3).replace(/0+$/, '');
+    const [, dec] = s3.split('.');
+    if (!dec) return `$${s3.replace(/\.$/, '')}`;
+    return dec.length === 1 ? `$${v.toFixed(2)}` : `$${s3}`;
+  }
+  return `$${v.toFixed(4).replace(/0+$/, '').replace(/\.$/, '')}`;
+}
+
+function getActiveModelBadge(id, env) {
+  const isPrimary = id === env.ANTHROPIC_MODEL;
+  const isFast = id === env.ANTHROPIC_DEFAULT_HAIKU_MODEL;
+  if (isPrimary && isFast) return ` ${C.gold}◀ ACTIVE PRIMARY + FAST${C.reset}`;
+  if (isPrimary) return ` ${C.gold}◀ ACTIVE PRIMARY${C.reset}`;
+  if (isFast) return ` ${C.cyan}◀ ACTIVE FAST/SUBAGENT${C.reset}`;
+  return '';
+}
+
+/**
+ * Fetch the full catalog (including promotions & plan_discounts) from /api/models.
+ * Returns null if the endpoint is unsupported (allowing /v1/models fallback).
+ */
+async function fetchGatewayCatalog(gatewayOrigin, apiKey) {
+  const headers = { Authorization: `Bearer ${apiKey}` };
+  const models = [];
+  let promotions = [];
+  let offset = 0;
+
+  while (true) {
+    const res = await fetch(`${gatewayOrigin}/api/models?limit=1000&offset=${offset}`, { headers });
+    if (!res.ok) {
+      if (offset === 0 && (res.status === 404 || res.status === 405)) return null;
+      throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    }
+    const json = await res.json();
+    if (!Array.isArray(json.models)) return null;
+    models.push(...json.models);
+    if (offset === 0 && Array.isArray(json.promotions)) {
+      promotions = json.promotions;
+    }
+    if (models.length >= (json.total || 0) || json.models.length === 0) break;
+    offset += json.models.length;
+  }
+
+  return { models, promotions };
+}
+
+function buildCatalogLists(catalog) {
+  const promoBySlug = new Map();
+  for (const pr of catalog.promotions) {
+    for (const slug of (pr.slugs || [])) {
+      const prev = promoBySlug.get(slug);
+      if (!prev || pr.free || (pr.percent_off || 0) > (prev.percent_off || 0)) {
+        promoBySlug.set(slug, pr);
+      }
+    }
+  }
+
+  const freeModels = [];
+  const discountedModels = [];
+
+  for (const entry of catalog.models) {
+    const m = entry.model || {};
+    if (m.status && m.status !== 'active') continue;
+    if (Array.isArray(m.output_modalities) && !m.output_modalities.includes('text')) continue;
+
+    const hostProvs = (entry.providers || []).filter(
+      p => p.billing_source === 'host_managed' && p.status !== 'retired'
+    );
+    if (hostProvs.length === 0) continue;
+
+    const disc = { free: 0, pro: 0, max: 0, ultra: 0 };
+    for (const p of hostProvs) {
+      if (!p.plan_discounts) continue;
+      for (const tier of ['free', 'pro', 'max', 'ultra']) {
+        if ((p.plan_discounts[tier] || 0) > disc[tier]) disc[tier] = p.plan_discounts[tier];
+      }
+    }
+
+    const pricedProvs = hostProvs.filter(p => p.input_nano_usd_per_million != null);
+    const discProvs = pricedProvs.filter(p => p.plan_discounts && Object.values(p.plan_discounts).some(v => v > 0));
+    const defSet = new Set(entry.default_provider_ids || []);
+    const pickPool = [...(discProvs.length > 0 ? discProvs : pricedProvs)].sort((a, b) => {
+      const defDiff = (defSet.has(a.id) ? 0 : 1) - (defSet.has(b.id) ? 0 : 1);
+      if (defDiff !== 0) return defDiff;
+      const inDiff = (a.input_nano_usd_per_million || 0) - (b.input_nano_usd_per_million || 0);
+      if (inDiff !== 0) return inDiff;
+      return (a.output_nano_usd_per_million || 0) - (b.output_nano_usd_per_million || 0);
+    });
+    const bestProv = pickPool[0];
+    const inUsd = bestProv ? bestProv.input_nano_usd_per_million / 1e9 : null;
+    const outUsd = bestProv ? (bestProv.output_nano_usd_per_million || 0) / 1e9 : null;
+
+    const promo = promoBySlug.get(m.slug) || null;
+    const promoPct = promo?.percent_off || 0;
+    const isAllZero = pricedProvs.length > 0 && pricedProvs.every(
+      p => p.input_nano_usd_per_million === 0 && (p.output_nano_usd_per_million || 0) === 0
+    );
+    const isFreeCore = disc.pro >= 100 && disc.max >= 100 && disc.ultra >= 100 && disc.free === 0;
+    const isPromoFree = Boolean(promo?.free);
+    const hasPlanDisc = disc.free > 0 || disc.pro > 0 || disc.max > 0 || disc.ultra > 0;
+
+    const item = {
+      id: m.slug,
+      tools: Boolean(m.supported_params?.tools),
+      ctx: m.context_window ? `${Math.round(m.context_window / 1024)}K` : 'Auto',
+      inUsd,
+      outUsd,
+      disc,
+      promo,
+      promoPct,
+      isPromoFree
+    };
+
+    if (isFreeCore || isPromoFree || isAllZero) {
+      freeModels.push(item);
+    } else if (promoPct > 0 || hasPlanDisc) {
+      discountedModels.push(item);
+    }
+  }
+
+  freeModels.sort((a, b) => (Number(b.tools) - Number(a.tools)) || a.id.localeCompare(b.id));
+  discountedModels.sort((a, b) =>
+    (b.promoPct - a.promoPct) ||
+    (b.disc.free - a.disc.free) ||
+    (b.disc.ultra - a.disc.ultra) ||
+    (b.disc.max - a.disc.max) ||
+    (b.disc.pro - a.disc.pro) ||
+    a.id.localeCompare(b.id)
+  );
+
+  return { freeModels, discountedModels };
+}
+
+function buildDiscountSummary(m) {
+  const parts = [];
+  if (m.promoPct > 0) {
+    const windowNote = m.promo?.label?.match(/\(([^)]+)\)/)?.[1];
+    const extras = [windowNote, m.inUsd != null ? `was ${fmtUsd(m.inUsd)}/${fmtUsd(m.outUsd)}` : null].filter(Boolean);
+    parts.push(`${C.green}${m.promoPct}% OFF Promo${C.reset}${extras.length ? ` ${C.gray}(${extras.join(', ')})${C.reset}` : ''}`);
+  }
+  const tierParts = [];
+  if (m.disc.free > 0) tierParts.push(`${m.disc.free}% Free`);
+  if (m.disc.pro > 0) tierParts.push(`${m.disc.pro}% Pro`);
+  if (m.disc.max > 0) tierParts.push(`${m.disc.max}% Max`);
+  if (m.disc.ultra > 0) tierParts.push(`${m.disc.ultra}% Ultra`);
+  if (tierParts.length > 0) parts.push(tierParts.join(' | '));
+  return parts.join(' | ');
+}
+
+async function promptAssignModel(modelItem, env) {
+  let targetId = modelItem.id;
+  if (modelItem.promo?.free_only_via_suffix && !targetId.endsWith(':free')) {
+    targetId = `${targetId}:free`;
+  }
+  if (!modelItem.tools) {
+    console.log(`\n${C.gold}[!] Note: ${targetId} is a decision/non-tool model and does not support coding tool calls.${C.reset}`);
+  }
+  const currentPrimary = env.ANTHROPIC_MODEL || 'gpt-6-luna';
+  const currentFast = env.ANTHROPIC_DEFAULT_HAIKU_MODEL || 'deepseek-v4.1-flash-1017';
+  console.log(`\nSelected ${C.white}${targetId}${C.reset}:`);
+  console.log(`  1. Set as Primary Model (keep Fast: ${currentFast})`);
+  console.log(`  2. Set as Fast/Subagent Model (keep Primary: ${currentPrimary})`);
+  console.log(`  3. Set as BOTH Primary & Fast`);
+  console.log(`  0. Cancel`);
+  const mode = (await ask(`Apply mode [1-3, 0]: `)).trim();
+  if (mode === '1') applyModelPair(targetId, currentFast);
+  else if (mode === '2') applyModelPair(currentPrimary, targetId);
+  else if (mode === '3') applyModelPair(targetId, targetId);
+}
+
 async function browseModels() {
   const settings = readClaudeSettings();
   const env = settings.env || {};
@@ -479,67 +664,111 @@ async function browseModels() {
     return;
   }
 
+  const gatewayOrigin = baseUrl.replace(/\/v1\/?$/, '').replace(/\/+$/, '');
   console.log(`\n${C.gold}═══ Q-BRANCH : LIVE ONLINE MODEL BROWSER ═══${C.reset}`);
-  console.log(`Fetching active models from ${C.cyan}${baseUrl}${C.reset}...\n`);
+  console.log(`Fetching live catalog & discounts from ${C.cyan}${gatewayOrigin}${C.reset}...\n`);
 
-  const modelsUrl = baseUrl.endsWith('/v1') ? `${baseUrl}/models` : `${baseUrl.replace(/\/+$/, '')}/v1/models`;
-  let data = [];
+  let freeModels = [];
+  let discountedModels = [];
+
   try {
-    const res = await fetch(modelsUrl, { headers: { Authorization: `Bearer ${apiKey}` } });
-    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-    const json = await res.json();
-    data = json.data || [];
+    const [catalog, creditsRes] = await Promise.all([
+      fetchGatewayCatalog(gatewayOrigin, apiKey),
+      fetch(`${gatewayOrigin}/api/v1/credits`, { headers: { Authorization: `Bearer ${apiKey}` } }).catch(() => null)
+    ]);
+
+    if (creditsRes && creditsRes.ok) {
+      const cJson = await creditsRes.json().catch(() => null);
+      if (cJson?.data) {
+        const total = cJson.data.total_credits || 0;
+        const used = cJson.data.total_usage || 0;
+        const rem = Math.max(0, total - used);
+        console.log(`${C.gray}Credits Remaining:${C.reset} ${C.green}$${rem.toFixed(2)}${C.reset} ${C.gray}/ $${total.toFixed(2)}${C.reset}\n`);
+      }
+    }
+
+    if (catalog) {
+      ({ freeModels, discountedModels } = buildCatalogLists(catalog));
+    } else {
+      // Fallback to generic OpenAI-compatible /v1/models endpoint
+      const v1Url = baseUrl.endsWith('/v1') ? `${baseUrl}/models` : `${gatewayOrigin}/v1/models`;
+      const res = await fetch(v1Url, { headers: { Authorization: `Bearer ${apiKey}` } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      const json = await res.json();
+      for (const m of (json.data || [])) {
+        const p = m.pricing || {};
+        const inCost = p.input_nano_usd_per_million_tokens;
+        const outCost = p.output_nano_usd_per_million_tokens;
+        const item = {
+          id: m.id,
+          tools: m.supports_tools !== false,
+          ctx: m.context_window_tokens ? `${Math.round(m.context_window_tokens / 1024)}K` : 'Auto',
+          inUsd: inCost != null ? inCost / 1e9 : null,
+          outUsd: outCost != null ? outCost / 1e9 : null,
+          disc: p.plan_discounts || { free: 0, pro: 0, max: 0, ultra: 0 },
+          promo: null,
+          promoPct: p.discount_percent || 0,
+          isPromoFree: false
+        };
+        const isFree = inCost === 0 && outCost === 0;
+        const hasDisc = item.promoPct > 0 || Object.values(item.disc).some(v => v > 0);
+        if (isFree) freeModels.push(item);
+        else if (hasDisc) discountedModels.push(item);
+      }
+    }
   } catch (e) {
     console.log(`${C.red}Failed to fetch models: ${e.message}${C.reset}`);
     return;
   }
 
-  const freeModels = [];
-  const proModels = [];
+  console.log(`${C.green}⭐ ZERO-COST PROMOTIONAL TIER (FREE):${C.reset}`);
+  if (freeModels.length === 0) {
+    console.log(`  ${C.gray}No zero-cost models reported by this gateway.${C.reset}`);
+  } else {
+    freeModels.forEach((m, idx) => {
+      const tag = m.isPromoFree
+        ? `${m.promo?.label || 'Free Promo'}${m.promo?.free_only_via_suffix ? ' (:free)' : ''}`
+        : (m.promoPct > 0 ? `Free Core | ${m.promoPct}% Promo` : 'Free Core');
+      const noTools = m.tools ? '' : ` ${C.gray}[No Tools]${C.reset}`;
+      const badge = getActiveModelBadge(m.id, env);
+      const label = `[F${idx + 1}]`.padEnd(6);
+      console.log(`  ${C.green}${label}${C.reset}${C.white}${m.id.padEnd(30)}${C.reset} ${C.gray}(${m.ctx.padStart(5)})${C.reset}  ${C.cyan}${tag}${C.reset}${noTools}${badge}`);
+    });
+  }
 
-  for (const m of data) {
-    const mid = m.id;
-    const p = m.pricing || {};
-    const inCost = p.input_nano_usd_per_million_tokens;
-    const outCost = p.output_nano_usd_per_million_tokens;
-    const isFree = (inCost === 0 && outCost === 0) || 
-                   /luna|1017|clef-flash|jev-latest/i.test(mid) ||
-                   mid === 'gpt-6-luna' || mid === 'deepseek-v4.1-flash-1017';
-
-    const item = {
-      id: mid,
-      tools: m.supports_tools !== false,
-      ctx: m.context_window_tokens ? `${Math.round(m.context_window_tokens / 1024)}K` : 'Auto'
-    };
-
-    if (isFree) {
-      freeModels.push(item);
-    } else if (/pro|opus|sonnet|claude|deepseek-v4|gpt-4/i.test(mid)) {
-      proModels.push(item);
+  console.log(`\n${C.gold}🏷️ DISCOUNTED MODELS (${discountedModels.length} Active Promos & Plan Discounts):${C.reset}`);
+  if (discountedModels.length === 0) {
+    console.log(`  ${C.gray}No discounted models currently listed.${C.reset}`);
+  } else {
+    discountedModels.forEach((m, idx) => {
+      let priceCol = 'N/A';
+      if (m.inUsd != null) {
+        const mult = m.promoPct > 0 && !(m.disc.free || m.disc.pro || m.disc.max || m.disc.ultra) ? (1 - m.promoPct / 100) : 1;
+        priceCol = `${fmtUsd(m.inUsd * mult)}/${fmtUsd(m.outUsd * mult)}${mult < 1 ? '*' : ''}`;
+      }
+      const label = `[D${idx + 1}]`.padEnd(6);
+      const summary = buildDiscountSummary(m);
+      const badge = getActiveModelBadge(m.id, env);
+      console.log(`  ${C.gold}${label}${C.reset}${C.white}${m.id.padEnd(30)}${C.reset} ${C.gray}(${m.ctx.padStart(5)})${C.reset}  ${C.white}${priceCol.padEnd(14)}${C.reset} ${summary}${badge}`);
+    });
+    if (discountedModels.some(m => m.promoPct > 0 && !(m.disc.free || m.disc.pro || m.disc.max || m.disc.ultra))) {
+      console.log(`  ${C.gray}* Effective promo $/M input/output; all other prices list base $/M before tier discount.${C.reset}`);
     }
   }
 
-  console.log(`${C.green}⭐ ZERO-COST PROMOTIONAL TIER (FREE):${C.reset}`);
-  freeModels.forEach((m, idx) => {
-    const active = (m.id === env.ANTHROPIC_MODEL) ? ` ${C.gold}◀ ACTIVE PRIMARY${C.reset}` :
-                   (m.id === env.ANTHROPIC_DEFAULT_HAIKU_MODEL) ? ` ${C.cyan}◀ ACTIVE FAST/SUBAGENT${C.reset}` : '';
-    console.log(`  ${C.green}[F${idx + 1}]${C.reset} ${C.white}${m.id.padEnd(28)}${C.reset} ${C.gray}(Ctx: ${m.ctx})${C.reset}${active}`);
-  });
-
-  console.log(`\n${C.gold}🚀 POPULAR FLAGSHIP & PRO MODELS:${C.reset}`);
-  proModels.slice(0, 10).forEach((m, idx) => {
-    const active = (m.id === env.ANTHROPIC_MODEL) ? ` ${C.gold}◀ ACTIVE PRIMARY${C.reset}` :
-                   (m.id === env.ANTHROPIC_DEFAULT_HAIKU_MODEL) ? ` ${C.cyan}◀ ACTIVE FAST/SUBAGENT${C.reset}` : '';
-    console.log(`  ${C.gold}[P${idx + 1}]${C.reset} ${C.white}${m.id.padEnd(28)}${C.reset} ${C.gray}(Ctx: ${m.ctx})${C.reset}${active}`);
-  });
+  const lunaIdx = freeModels.findIndex(m => m.id === 'gpt-6-luna');
+  const dsIdx = freeModels.findIndex(m => m.id === 'deepseek-v4.1-flash-1017');
+  const lunaTag = lunaIdx >= 0 ? `[F${lunaIdx + 1}] ` : '';
+  const dsTag = dsIdx >= 0 ? `[F${dsIdx + 1}] ` : '';
 
   console.log(`\n${C.cyan}Options:${C.reset}`);
-  console.log(`  1. Set [F2] GPT-6 Luna (Primary) + DeepSeek Flash 1017 (Fast) ${C.green}[Recommended Free Pair]${C.reset}`);
-  console.log(`  2. Set [F3] DeepSeek Flash 1017 (All-round speed) ${C.green}[Zero Cost]${C.reset}`);
+  console.log(`  1. Set ${lunaTag}GPT-6 Luna (Primary) + ${dsTag}DeepSeek Flash 1017 (Fast) ${C.green}[Recommended Free Pair]${C.reset}`);
+  console.log(`  2. Set ${dsTag}DeepSeek Flash 1017 (All-round speed) ${C.green}[Zero Cost]${C.reset}`);
   console.log(`  3. Manually enter model names`);
+  console.log(`  ${C.gray}Tip: Type any tag above (e.g. F1 or D1) directly to select it.${C.reset}`);
   console.log(`  0. Cancel`);
-  
-  const choice = await ask(`\nSelect an option [1-3, 0]: `);
+
+  const choice = (await ask(`\nSelect [1-3, F#, D#, 0]: `)).trim();
 
   if (choice === '1') {
     applyModelPair('gpt-6-luna', 'deepseek-v4.1-flash-1017');
@@ -549,6 +778,17 @@ async function browseModels() {
     const p = await ask(`Enter Primary Model ID (e.g. gpt-6-luna): `);
     const f = await ask(`Enter Fast Model ID (e.g. deepseek-v4.1-flash-1017): `);
     if (p && f) applyModelPair(p, f);
+  } else {
+    const tagMatch = choice.match(/^([fd])(\d+)$/i);
+    if (tagMatch) {
+      const list = tagMatch[1].toUpperCase() === 'F' ? freeModels : discountedModels;
+      const picked = list[parseInt(tagMatch[2], 10) - 1];
+      if (picked) {
+        await promptAssignModel(picked, env);
+      } else {
+        console.log(`${C.red}Selection ${choice.toUpperCase()} out of range.${C.reset}`);
+      }
+    }
   }
 }
 
