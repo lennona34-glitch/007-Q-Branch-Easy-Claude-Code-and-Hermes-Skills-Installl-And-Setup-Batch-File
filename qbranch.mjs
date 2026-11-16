@@ -81,9 +81,14 @@ function runWsl(bashCmd, options = {}) {
   }
 }
 
+const IS_PORTABLE_MODE = Boolean(
+  process.env.CLAUDE_CONFIG_DIR || process.env.HERMES_HOME || process.env.QBRANCH_PORTABLE === '1'
+);
 const CLAUDE_ACTIVE_SETTINGS_PATH = process.env.CLAUDE_CONFIG_DIR
   ? path.join(process.env.CLAUDE_CONFIG_DIR, 'settings.json')
   : CLAUDE_SETTINGS_PATH;
+const JEV_GATE_ALLOW_RULES = ['mcp__jev__jev_judge', 'mcp__jev__jev_gate'];
+const WSL_HERMES_CONFIG_UNC = '\\\\wsl.localhost\\kali-linux\\home\\Ade\\.hermes\\config.yaml';
 
 function readClaudeSettings() {
   for (const p of [CLAUDE_ACTIVE_SETTINGS_PATH, CLAUDE_SETTINGS_PATH]) {
@@ -105,16 +110,244 @@ function saveClaudeSettings(settings) {
   }
 }
 
-function syncToHermes(primaryModel, baseUrl, apiKey) {
+function getClaudeJsonPaths() {
+  const targets = [path.join(USER_HOME, '.claude.json')];
+  if (process.env.CLAUDE_CONFIG_DIR) {
+    targets.push(path.join(process.env.CLAUDE_CONFIG_DIR, '.claude.json'));
+  }
+  return [...new Set(targets)];
+}
+
+function readJsonSafe(filePath, fallback = {}) {
   try {
+    if (fs.existsSync(filePath)) {
+      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    }
+  } catch (e) {}
+  return fallback;
+}
+
+function writeJsonSafe(filePath, data) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function toWslPath(winPath) {
+  const resolved = path.resolve(winPath).replace(/\\/g, '/');
+  return resolved.replace(/^([A-Za-z]):/, (_, d) => `/mnt/${d.toLowerCase()}`);
+}
+
+function findCachedNpxJevDir() {
+  const npxRoot = path.join(os.homedir(), 'AppData', 'Local', 'npm-cache', '_npx');
+  const localAppData = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'npm-cache', '_npx') : null;
+  for (const root of new Set([localAppData, npxRoot].filter(Boolean))) {
+    try {
+      if (!fs.existsSync(root)) continue;
+      for (const entry of fs.readdirSync(root)) {
+        const candidate = path.join(root, entry, 'node_modules', 'jev-use', 'dist', 'cli.js');
+        if (fs.existsSync(candidate)) {
+          return path.join(root, entry);
+        }
+      }
+    } catch (e) {}
+  }
+  return null;
+}
+
+function getLocalJevBundleDir() {
+  const candidates = [
+    process.env.USB_ROOT ? path.join(process.env.USB_ROOT, 'runtime', 'jev-use') : null,
+    path.join(SCRIPT_DIR, 'runtime', 'jev-use'),
+    path.join(USER_HOME, '.claude', 'jev-use'),
+  ].filter(Boolean);
+  for (const dir of candidates) {
+    if (fs.existsSync(path.join(dir, 'node_modules', 'jev-use', 'dist', 'cli.js'))) {
+      return dir;
+    }
+  }
+  return null;
+}
+
+function ensureLocalJevBundle(destRoot, allowNpmInstall = false) {
+  const targetCli = path.join(destRoot, 'node_modules', 'jev-use', 'dist', 'cli.js');
+  if (fs.existsSync(targetCli)) return targetCli;
+
+  const existing = getLocalJevBundleDir();
+  if (existing) {
+    safeCopyDir(path.join(existing, 'node_modules'), path.join(destRoot, 'node_modules'));
+    if (fs.existsSync(targetCli)) return targetCli;
+  }
+
+  const npxCached = findCachedNpxJevDir();
+  if (npxCached) {
+    safeCopyDir(path.join(npxCached, 'node_modules'), path.join(destRoot, 'node_modules'));
+    if (fs.existsSync(targetCli)) return targetCli;
+  }
+
+  if (allowNpmInstall) {
+    try {
+      fs.mkdirSync(destRoot, { recursive: true });
+      const npmBin = process.env.USB_ROOT && fs.existsSync(path.join(process.env.USB_ROOT, 'runtime', 'node', 'npm.cmd'))
+        ? path.join(process.env.USB_ROOT, 'runtime', 'node', 'npm.cmd')
+        : 'npm';
+      execFileSync(npmBin, ['--prefix', destRoot, 'install', '--no-save', 'jev-use@0.8.0'], {
+        stdio: 'inherit',
+        shell: true
+      });
+      if (fs.existsSync(targetCli)) return targetCli;
+    } catch (e) {}
+  }
+  return null;
+}
+
+function resolveJevInvocation(preferBundleDir = null) {
+  const cliJs = preferBundleDir
+    ? ensureLocalJevBundle(preferBundleDir, false)
+    : (getLocalJevBundleDir()
+      ? path.join(getLocalJevBundleDir(), 'node_modules', 'jev-use', 'dist', 'cli.js')
+      : ensureLocalJevBundle(path.join(USER_HOME, '.claude', 'jev-use'), false));
+  if (cliJs && fs.existsSync(cliJs)) {
+    return {
+      command: 'node',
+      args: [cliJs, 'serve'],
+      hookCommand: `node "${cliJs}" hook gate`,
+      cliJs
+    };
+  }
+  return {
+    command: 'npx',
+    args: ['-y', 'jev-use@0.8.0', 'serve'],
+    hookCommand: 'npx -y jev-use@0.8.0 hook gate',
+    cliJs: null
+  };
+}
+
+function getJevGateStatus(settings) {
+  const preTool = settings?.hooks?.PreToolUse;
+  if (!Array.isArray(preTool)) return false;
+  return preTool.some(entry =>
+    Array.isArray(entry?.hooks) && entry.hooks.some(h => typeof h?.command === 'string' && h.command.includes('jev-use'))
+  );
+}
+
+function setJevGateEnabled(settings, enable, hookCommand) {
+  settings.hooks = settings.hooks || {};
+  const existing = Array.isArray(settings.hooks.PreToolUse) ? settings.hooks.PreToolUse : [];
+  const filtered = existing.filter(entry =>
+    !(Array.isArray(entry?.hooks) && entry.hooks.some(h => typeof h?.command === 'string' && h.command.includes('jev-use')))
+  );
+  if (enable) {
+    filtered.push({
+      matcher: 'Bash|Write|Edit',
+      hooks: [{
+        type: 'command',
+        command: hookCommand,
+        timeout: 30,
+        statusMessage: 'Jev gate: risk-checking this action'
+      }]
+    });
+  }
+  if (filtered.length > 0) {
+    settings.hooks.PreToolUse = filtered;
+  } else {
+    delete settings.hooks.PreToolUse;
+    if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+  }
+}
+
+/**
+ * Update WSL Hermes config.yaml & .env cleanly through Hermes's own bootstrapped Python runtime.
+ */
+function runWslHermesPython(payloadObj) {
+  const tmpPy = path.join(os.tmpdir(), `qbranch_hermes_${process.pid}.py`);
+  const tmpJson = path.join(os.tmpdir(), `qbranch_hermes_${process.pid}.json`);
+  const pyCode = [
+    'import json, sys',
+    'sys.path.insert(0, "/home/Ade/.hermes/hermes-agent")',
+    'import hermes_bootstrap',
+    'from hermes_cli.config import load_config, save_config, save_env_value',
+    'from hermes_cli.mcp_config import validate_mcp_server_entry',
+    `with open(${JSON.stringify(toWslPath(tmpJson))}, "r", encoding="utf-8") as f:`,
+    '    p = json.load(f)',
+    'for k, v in (p.get("env") or {}).items():',
+    '    if v: save_env_value(k, v)',
+    'cfg = load_config()',
+    'if p.get("primaryModel"):',
+    '    cfg.setdefault("model", {})["default"] = p["primaryModel"]',
+    'if p.get("baseUrl"):',
+    '    cfg.setdefault("model", {})["base_url"] = p["baseUrl"]',
+    '    cfg.setdefault("model", {})["provider"] = "custom"',
+    'if p.get("apiKey"):',
+    '    cfg.setdefault("model", {})["api_key"] = p["apiKey"]',
+    'if p.get("fastModel") is not None:',
+    '    if p["fastModel"]: cfg.setdefault("delegation", {})["model"] = p["fastModel"]',
+    '    else: cfg.setdefault("delegation", {}).pop("model", None)',
+    'if p.get("reasoning") is not None:',
+    '    cfg.setdefault("agent", {})["reasoning_effort"] = p["reasoning"]',
+    'if p.get("serviceTier") is not None:',
+    '    cfg.setdefault("agent", {})["service_tier"] = p["serviceTier"]',
+    'if p.get("wireJevMcp"):',
+    '    entry = {"command": "/home/Ade/.local/bin/node", "args": ["/home/Ade/.hermes/tools/jev-use/node_modules/jev-use/dist/cli.js", "serve"], "env": {"TYPESAFE_API_KEY": "${TYPESAFE_API_KEY}", "TYPESAFE_BASE_URL": "${TYPESAFE_BASE_URL}"}}',
+    '    issues = validate_mcp_server_entry("jev", entry)',
+    '    if not issues:',
+    '        cfg.setdefault("mcp_servers", {})["jev"] = entry',
+    'save_config(cfg)',
+    'print("OK")'
+  ].join('\n');
+
+  try {
+    fs.writeFileSync(tmpJson, JSON.stringify(payloadObj), 'utf8');
+    fs.writeFileSync(tmpPy, pyCode, 'utf8');
+    const cmd = `PY=$(grep -m1 -oE "/home/[^ ]+/python3" /home/Ade/.hermes/hermes-agent/.hermes/bin/hermes 2>/dev/null || echo python3); "$PY" "${toWslPath(tmpPy)}"`;
+    const out = execFileSync('wsl.exe', ['-d', 'kali-linux', '-u', 'Ade', 'bash', '-c', cmd], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    });
+    return out.includes('OK');
+  } catch (e) {
+    return false;
+  } finally {
+    try { fs.unlinkSync(tmpPy); } catch (e) {}
+    try { fs.unlinkSync(tmpJson); } catch (e) {}
+  }
+}
+
+function syncToHermes(primaryModel, baseUrl, apiKey, fastModel = null) {
+  try {
+    const hermesUrl = baseUrl
+      ? (baseUrl.endsWith('/v1') ? baseUrl : `${baseUrl.replace(/\/+$/, '')}/v1`)
+      : null;
+    const typesafeBase = baseUrl ? baseUrl.replace(/\/v1\/?$/, '').replace(/\/+$/, '') : null;
+
+    if (process.env.USB_ROOT) {
+      const usbCfgPath = path.join(process.env.USB_ROOT, 'config', 'hermes', 'config.yaml');
+      const usbEnvPath = path.join(process.env.USB_ROOT, 'config', 'hermes', '.env');
+      writePortableHermesFiles(
+        path.join(process.env.USB_ROOT, 'config', 'hermes'),
+        { primaryModel, fastModel, baseUrl: hermesUrl, apiKey, typesafeBase }
+      );
+      if (fs.existsSync(usbCfgPath) || fs.existsSync(usbEnvPath)) {
+        // Also keep WSL in sync if present
+      }
+    }
+
+    const ok = runWslHermesPython({
+      primaryModel: primaryModel || null,
+      fastModel: fastModel || null,
+      baseUrl: hermesUrl,
+      apiKey: apiKey || null,
+      env: {
+        ...(apiKey ? { TYPESAFE_API_KEY: apiKey } : {}),
+        ...(typesafeBase ? { TYPESAFE_BASE_URL: typesafeBase } : {})
+      }
+    });
+    if (ok) return true;
+
     const commands = [];
     if (primaryModel) commands.push(`hermes config set model.default "${primaryModel}"`);
-    if (baseUrl) {
-      const hermesUrl = baseUrl.endsWith('/v1') ? baseUrl : `${baseUrl.replace(/\/+$/, '')}/v1`;
-      commands.push(`hermes config set model.base_url "${hermesUrl}"`);
-    }
+    if (fastModel) commands.push(`hermes config set delegation.model "${fastModel}"`);
+    if (hermesUrl) commands.push(`hermes config set model.base_url "${hermesUrl}"`);
     if (apiKey) commands.push(`hermes config set model.api_key "${apiKey}"`);
-    
     if (commands.length > 0) {
       runWsl(commands.join('; '));
       return true;
@@ -123,6 +356,68 @@ function syncToHermes(primaryModel, baseUrl, apiKey) {
     return false;
   }
   return true;
+}
+
+function writePortableHermesFiles(hermesConfigDir, opts) {
+  fs.mkdirSync(hermesConfigDir, { recursive: true });
+  const existingCfgPath = path.join(hermesConfigDir, 'config.yaml');
+  let curPrimary = opts.primaryModel || 'gpt-6-luna';
+  let curFast = opts.fastModel === undefined ? 'deepseek-v4.1-flash-1017' : opts.fastModel;
+  let curUrl = opts.baseUrl || 'https://api.experientiallabs.ai/v1';
+  let curKey = opts.apiKey || '';
+  let curReasoning = opts.reasoning || 'none';
+  if (fs.existsSync(existingCfgPath)) {
+    const raw = fs.readFileSync(existingCfgPath, 'utf8');
+    if (!opts.primaryModel) curPrimary = raw.match(/^\s*default:\s*"([^"]+)"/m)?.[1] || curPrimary;
+    if (!opts.baseUrl) curUrl = raw.match(/^\s*base_url:\s*"([^"]+)"/m)?.[1] || curUrl;
+    if (!opts.apiKey) curKey = raw.match(/^\s*api_key:\s*"([^"]+)"/m)?.[1] || curKey;
+    if (opts.fastModel === undefined) curFast = raw.match(/delegation:\s*\r?\n\s*model:\s*"([^"]+)"/m)?.[1] || curFast;
+    if (!opts.reasoning) curReasoning = raw.match(/reasoning_effort:\s*"([^"]+)"/m)?.[1] || curReasoning;
+  }
+  const usbRootGuess = path.resolve(hermesConfigDir, '..', '..');
+  const bundledCli = path.join(usbRootGuess, 'runtime', 'jev-use', 'node_modules', 'jev-use', 'dist', 'cli.js');
+  const bundledNode = path.join(usbRootGuess, 'runtime', 'node', 'node.exe');
+  const jevCmd = fs.existsSync(bundledCli)
+    ? (fs.existsSync(bundledNode) ? bundledNode.replace(/\\/g, '/') : 'node')
+    : 'npx';
+  const jevArgs = fs.existsSync(bundledCli)
+    ? `["${bundledCli.replace(/\\/g, '/')}", "serve"]`
+    : '["-y", "jev-use@0.8.0", "serve"]';
+  const typesafeBase = opts.typesafeBase || curUrl.replace(/\/v1\/?$/, '').replace(/\/+$/, '');
+  const delegationModelLine = curFast ? `  model: "${curFast}"\n` : '';
+  const hermesYaml = `# 007 Q-Branch Portable Configuration
+_config_version: 53
+model:
+  default: "${curPrimary}"
+  provider: "custom"
+  base_url: "${curUrl}"
+  api_key: "${curKey}"
+agent:
+  reasoning_effort: "${curReasoning}"
+delegation:
+${delegationModelLine}  max_iterations: 250
+mcp_servers:
+  jev:
+    command: "${jevCmd}"
+    args: ${jevArgs}
+    env:
+      TYPESAFE_API_KEY: "${curKey}"
+      TYPESAFE_BASE_URL: "${typesafeBase}"
+runtime:
+  nofile_soft_limit: 4096
+tools:
+  tool_search:
+    enabled: "off"
+`;
+  fs.writeFileSync(existingCfgPath, hermesYaml, 'utf8');
+  const hermesEnv = `# 007 Q-Branch Portable Environment
+OPENAI_API_KEY=${curKey}
+OPENAI_BASE_URL=${curUrl}
+CUSTOM_API_KEY=${curKey}
+TYPESAFE_API_KEY=${curKey}
+TYPESAFE_BASE_URL=${typesafeBase}
+`;
+  fs.writeFileSync(path.join(hermesConfigDir, '.env'), hermesEnv, 'utf8');
 }
 
 // Curated Mission Loadout Profiles
@@ -139,10 +434,10 @@ const PROFILES = {
       // 2. Recon, Pwn & Reversing (7)
       'reverse-engineer', 'ghidra-reverse', 'binary-diff', 'protocol-reverse',
       'pwn-chain', 'bug-bounty', 'evidence-hygiene',
-      // 3. Autonomous Swarms & Agent Minds (9)
+      // 3. Autonomous Swarms & Agent Minds (10)
       'anti-sycophancy', 'agent-squad', 'autonomous-agents', 'goal-loop',
       'planning-with-files', 'agent-memory', 'subagent-orchestrator',
-      'doubt-driven-development', 'systematic-debugging',
+      'doubt-driven-development', 'systematic-debugging', 'jev-use',
       // 4. Hardened Shells & Elite Codecraft (17)
       'uncle-bob-craft', 'code-reviewer', 'anti-ui-slop', 'simplify-code',
       'tdd-workflow', 'fastapi-pro', 'go-concurrency-patterns', 'rust-patterns',
@@ -172,7 +467,7 @@ const PROFILES = {
       'anti-sycophancy', 'agent-squad', 'autonomous-agents', 'goal-loop',
       'planning-with-files', 'agent-memory', 'subagent-orchestrator',
       'doubt-driven-development', 'systematic-debugging', 'tree-ring-memory',
-      'council-multi-model', 'code-reviewer', 'simplify-code', 'anti-ui-slop',
+      'council-multi-model', 'jev-use', 'code-reviewer', 'simplify-code', 'anti-ui-slop',
       'uncle-bob-craft', 'mcp-builder', 'docker-expert', 'bash-defensive-patterns'
     ]
   }
@@ -213,25 +508,35 @@ async function applyMissionLoadout(profileKey) {
   console.log(`  ${C.green}✓${C.reset} Baseline preserved in ${C.cyan}~/.claude/skills.backup${C.reset}`);
 
   // 2. Clear and deploy to Claude Code
-  console.log(`  [*] Deploying ${profile.skills.length} skills to Claude Code (~/.claude/skills)...`);
-  fs.mkdirSync(CLAUDE_SKILLS_PATH, { recursive: true });
-  for (const item of fs.readdirSync(CLAUDE_SKILLS_PATH)) {
-    fs.rmSync(path.join(CLAUDE_SKILLS_PATH, item), { recursive: true, force: true });
+  const targetClaudeSkillsDir = process.env.CLAUDE_CONFIG_DIR
+    ? path.join(process.env.CLAUDE_CONFIG_DIR, 'skills')
+    : CLAUDE_SKILLS_PATH;
+  console.log(`  [*] Deploying ${profile.skills.length} skills to Claude Code...`);
+  fs.mkdirSync(targetClaudeSkillsDir, { recursive: true });
+  for (const item of fs.readdirSync(targetClaudeSkillsDir)) {
+    fs.rmSync(path.join(targetClaudeSkillsDir, item), { recursive: true, force: true });
   }
+  const deployList = [...new Set([...profile.skills, ...(inspectJevState().hasMcp ? ['jev-use'] : [])])];
   let installedClaude = 0;
-  for (const skill of profile.skills) {
+  for (const skill of deployList) {
     const src = resolveSkillPath(skill);
     if (src && fs.existsSync(src)) {
-      fs.cpSync(src, path.join(CLAUDE_SKILLS_PATH, skill), { recursive: true });
+      fs.cpSync(src, path.join(targetClaudeSkillsDir, skill), { recursive: true });
       installedClaude++;
     }
   }
   console.log(`  ${C.green}✓${C.reset} Claude Code updated: ${C.white}${installedClaude} skills active${C.reset}`);
 
-  // 3. Deploy to Hermes Agent (WSL Kali)
-  console.log(`  [*] Synchronizing to Hermes Agent (WSL Kali ~/.hermes/skills/vault)...`);
-  runWsl('mkdir -p /home/Ade/.hermes/skills/vault && rm -rf /home/Ade/.hermes/skills/vault/*');
-  runWsl('cp -r /mnt/c/Users/adria/.claude/skills/* /home/Ade/.hermes/skills/vault/');
+  // 3. Deploy to Hermes Agent (WSL Kali or Portable USB)
+  if (process.env.USB_ROOT) {
+    const usbHermesVault = path.join(process.env.USB_ROOT, 'config', 'hermes', 'skills', 'vault');
+    fs.rmSync(usbHermesVault, { recursive: true, force: true });
+    safeCopyDir(targetClaudeSkillsDir, usbHermesVault);
+  } else {
+    console.log(`  [*] Synchronizing to Hermes Agent (WSL Kali ~/.hermes/skills/vault)...`);
+    runWsl('mkdir -p /home/Ade/.hermes/skills/vault && rm -rf /home/Ade/.hermes/skills/vault/*');
+    runWsl(`cp -r "${toWslPath(targetClaudeSkillsDir)}/." /home/Ade/.hermes/skills/vault/`);
+  }
 
   // 4. Stow Hermes built-in clutter (apple, productivity)
   console.log(`  [*] Stowing Hermes built-in office & personal clutter...`);
@@ -324,7 +629,7 @@ async function runSetupWizard() {
   }
 
   // 4. API Key & Gateway Configuration
-  console.log(`${C.gold}[4/4] Gateway & API Key Configuration...${C.reset}`);
+  console.log(`${C.gold}[4/4] Gateway, API Key & Jev Intervention...${C.reset}`);
   const settings = readClaudeSettings();
   const currentKey = settings.env?.ANTHROPIC_AUTH_TOKEN || '';
   if (currentKey) {
@@ -334,15 +639,26 @@ async function runSetupWizard() {
     await configureApi();
   }
 
-  // 5. Deploy Bundled Skills
-  console.log(`[*] Deploying Bundled 44 Special Ops Skills...`);
+  // 5. Deploy Bundled Skills & Wire Jev + Hermes 2-Model Split
+  console.log(`[*] Deploying Bundled Special Ops Skills (incl. jev-use)...`);
   await applyMissionLoadout('special_ops');
+  const latestSettings = readClaudeSettings();
+  if (latestSettings.env?.ANTHROPIC_AUTH_TOKEN) {
+    console.log(`[*] Wiring Jev Intervention & Hermes 2-Model Split...`);
+    syncJevIntegration({ allowNpmInstall: true });
+    syncToHermes(
+      latestSettings.env.ANTHROPIC_MODEL || 'gpt-6-luna',
+      latestSettings.env.ANTHROPIC_BASE_URL || 'https://api.experientiallabs.ai',
+      latestSettings.env.ANTHROPIC_AUTH_TOKEN,
+      latestSettings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL || 'deepseek-v4.1-flash-1017'
+    );
+  }
 
   console.log(`\n${C.cyan}════════════════════════════════════════════════════════════════════════════${C.reset}`);
   console.log(`  ${C.gold}🎉 007 Q-BRANCH SETUP COMPLETE!${C.reset}`);
   console.log(`  You are ready to launch:`);
-  console.log(`    [1] Claude Code  (Tag Team: GPT-6 Luna + DeepSeek Flash 1017)`);
-  console.log(`    [2] Hermes Agent (Autonomous GPT-6 Luna in WSL)`);
+  console.log(`    [1] Claude Code  (Tag Team + Jev Intervention)`);
+  console.log(`    [2] Hermes Agent (Autonomous Primary + Subagent Split + Jev MCP)`);
   console.log(`${C.cyan}════════════════════════════════════════════════════════════════════════════${C.reset}\n`);
   await ask(`Press Enter to return to Mission Menu... `);
 }
@@ -426,6 +742,9 @@ async function showStatus() {
     try { claudeSkillsCount = fs.readdirSync(CLAUDE_SKILLS_PATH).length; } catch (e) {}
   }
 
+  const jevSt = inspectJevState();
+  const hermesSummary = readHermesYamlSummary();
+
   console.log(`\n${C.cyan}╔════════════════════════════════════════════════════════════════════════════╗${C.reset}`);
   console.log(`${C.cyan}║${C.reset}  ${C.gold}007 Q-BRANCH : AGENT INTELLIGENCE HUB${C.reset}                                 ${C.cyan}║${C.reset}`);
   console.log(`${C.cyan}╚════════════════════════════════════════════════════════════════════════════╝${C.reset}`);
@@ -433,6 +752,10 @@ async function showStatus() {
   console.log(`  ${C.gray}API Key            :${C.reset} ${C.green}${maskedKey}${C.reset}`);
   console.log(`  ${C.gray}Primary Model      :${C.reset} ${C.gold}${primaryModel}${C.reset} ${C.green}[FLAGSHIP]${C.reset}`);
   console.log(`  ${C.gray}Fast Aux Model     :${C.reset} ${C.cyan}${auxModel}${C.reset} ${C.green}[SUBAGENT]${C.reset}`);
+  if (hermesSummary.exists) {
+    console.log(`  ${C.gray}Hermes Split       :${C.reset} ${C.gold}${hermesSummary.defaultModel}${C.reset} + ${C.cyan}${hermesSummary.delegationModel}${C.reset} ${C.gray}(Reasoning: ${hermesSummary.reasoningEffort})${C.reset}`);
+  }
+  console.log(`  ${C.gray}Jev Intervention   :${C.reset} ${jevSt.hasMcp && jevSt.hasMcpKey ? `${C.green}ACTIVE${C.reset}` : `${C.red}UNCONFIGURED${C.reset}`} ${C.gray}(Hermes: ${jevSt.hermesJev ? 'ON' : 'OFF'} | PreToolUse Gate: ${jevSt.gateOn ? 'ON' : 'OFF'})${C.reset}`);
   console.log(`  ${C.gray}Skills Master Vault:${C.reset} ${C.magenta}${vaultCount.toLocaleString()} skills available${C.reset}`);
   console.log(`  ${C.gray}Claude Code Active :${C.reset} ${C.white}${claudeSkillsCount} installed${C.reset}`);
   console.log(`${C.cyan}────────────────────────────────────────────────────────────────────────────${C.reset}\n`);
@@ -471,11 +794,14 @@ async function configureApi() {
 
   settings.env.ANTHROPIC_BASE_URL = targetUrl.replace(/\/+v1\/?$/, '');
   settings.env.ANTHROPIC_AUTH_TOKEN = targetKey;
+  settings.env.TYPESAFE_BASE_URL = settings.env.ANTHROPIC_BASE_URL;
+  settings.env.TYPESAFE_API_KEY = targetKey;
   saveClaudeSettings(settings);
 
-  console.log(`[*] Syncing to Hermes Agent...`);
+  console.log(`[*] Syncing to Hermes Agent & Jev Intervention...`);
   syncToHermes(null, targetUrl, targetKey);
-  console.log(`${C.green}✓ Saved and synchronized across Claude Code & Hermes!${C.reset}\n`);
+  syncJevIntegration({ apiKey: targetKey, baseUrl: settings.env.ANTHROPIC_BASE_URL });
+  console.log(`${C.green}✓ Saved and synchronized across Claude Code, Hermes & Jev!${C.reset}\n`);
 }
 
 function fmtUsd(v) {
@@ -812,11 +1138,11 @@ function applyModelPair(primary, fast) {
   settings.modelSettings[fast] = { effortLevel: 'medium' };
 
   saveClaudeSettings(settings);
-  syncToHermes(primary, settings.env.ANTHROPIC_BASE_URL, settings.env.ANTHROPIC_AUTH_TOKEN);
+  syncToHermes(primary, settings.env.ANTHROPIC_BASE_URL, settings.env.ANTHROPIC_AUTH_TOKEN, fast);
 
-  console.log(`\n${C.green}✓ Models updated!${C.reset}`);
-  console.log(`  Primary (Sonnet / Hermes): ${C.gold}${primary}${C.reset}`);
-  console.log(`  Fast Aux (Haiku / Subagent): ${C.cyan}${fast}${C.reset}\n`);
+  console.log(`\n${C.green}✓ Models updated across Claude Code & Hermes!${C.reset}`);
+  console.log(`  Primary (Claude / Hermes)     : ${C.gold}${primary}${C.reset}`);
+  console.log(`  Fast Aux (Haiku / Hermes Sub) : ${C.cyan}${fast}${C.reset}\n`);
 }
 
 function getSkillDescription(skillName) {
@@ -1473,18 +1799,29 @@ async function buildUsbDrive(currentDir) {
   fs.writeFileSync(path.join(targetPath, 'runtime', 'hermes', 'hermes.cmd'), hermesCmd, 'utf8');
   console.log(`  ${C.green}✓ Hermes Agent runner & uv engine packaged.${C.reset}\n`);
 
+  // Phase 4b: Bundle Jev Intervention Engine (jev-use MCP + Hook Gate)
+  const destJevRoot = path.join(targetPath, 'runtime', 'jev-use');
+  const bundledJevCli = ensureLocalJevBundle(destJevRoot, false);
+  if (bundledJevCli) {
+    console.log(`  ${C.green}✓ Jev Intervention Engine (jev-use) bundled for offline USB use.${C.reset}\n`);
+  }
+
   // Phase 5: API Keys & Custom Gateway Settings
   console.log(`${C.gold}[5/6] Exporting credentials & zero-cost gateway configurations...${C.reset}`);
   const activeSettings = readClaudeSettings();
-  const currentKey = activeSettings.env?.ANTHROPIC_AUTH_TOKEN || 'xpl_de71f2d6f46ee963be11c0cfe63225085d1eb7d6';
+  const currentKey = activeSettings.env?.ANTHROPIC_AUTH_TOKEN || '';
   const currentUrl = activeSettings.env?.ANTHROPIC_BASE_URL || 'https://api.experientiallabs.ai';
+  const typesafeUrl = currentUrl.replace(/\/v1\/?$/, '').replace(/\/+$/, '');
   const primaryModel = activeSettings.env?.ANTHROPIC_MODEL || 'gpt-6-luna';
   const fastModel = activeSettings.env?.ANTHROPIC_DEFAULT_HAIKU_MODEL || 'deepseek-v4.1-flash-1017';
+  const gateWasEnabled = getJevGateStatus(activeSettings);
 
   const portableClaudeSettings = {
     env: {
       ANTHROPIC_BASE_URL: currentUrl,
       ANTHROPIC_AUTH_TOKEN: currentKey,
+      TYPESAFE_BASE_URL: typesafeUrl,
+      TYPESAFE_API_KEY: currentKey,
       ANTHROPIC_MODEL: primaryModel,
       ANTHROPIC_DEFAULT_SONNET_MODEL: primaryModel,
       ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: primaryModel,
@@ -1502,39 +1839,56 @@ async function buildUsbDrive(currentDir) {
       [fastModel]: { effortLevel: "medium" }
     },
     permissions: {
-      allowAll: true
+      allowAll: true,
+      allow: [...JEV_GATE_ALLOW_RULES]
     }
   };
+  if (gateWasEnabled) {
+    const inv = bundledJevCli
+      ? { hookCommand: `node "${bundledJevCli}" hook gate` }
+      : { hookCommand: 'npx -y jev-use@0.8.0 hook gate' };
+    setJevGateEnabled(portableClaudeSettings, true, inv.hookCommand);
+  }
   fs.writeFileSync(path.join(targetPath, 'config', 'claude', 'settings.json'), JSON.stringify(portableClaudeSettings, null, 2), 'utf8');
   fs.writeFileSync(path.join(targetPath, 'data', 'home', '.claude', 'settings.json'), JSON.stringify(portableClaudeSettings, null, 2), 'utf8');
+  fs.writeFileSync(path.join(targetPath, 'config', 'claude', '.usb_root.txt'), targetPath.endsWith(path.sep) ? targetPath : `${targetPath}${path.sep}`, 'utf8');
 
-  // Hermes config.yaml and .env
+  // Portable Claude .claude.json with pre-configured Jev MCP server
+  const portableJevMcp = bundledJevCli
+    ? {
+        type: 'stdio',
+        command: path.join(destNodeDir, 'node.exe'),
+        args: [bundledJevCli, 'serve'],
+        env: { TYPESAFE_API_KEY: currentKey, TYPESAFE_BASE_URL: typesafeUrl }
+      }
+    : {
+        type: 'stdio',
+        command: 'npx',
+        args: ['-y', 'jev-use@0.8.0', 'serve'],
+        env: { TYPESAFE_API_KEY: currentKey, TYPESAFE_BASE_URL: typesafeUrl }
+      };
+  for (const cj of [
+    path.join(targetPath, 'config', 'claude', '.claude.json'),
+    path.join(targetPath, 'data', 'home', '.claude.json')
+  ]) {
+    const existing = readJsonSafe(cj, {});
+    existing.mcpServers = { ...(existing.mcpServers || {}), jev: portableJevMcp };
+    writeJsonSafe(cj, existing);
+  }
+
+  // Hermes config.yaml and .env (with 2-model delegation split + Jev MCP)
   const hermesApiUrl = currentUrl.endsWith('/v1') ? currentUrl : `${currentUrl.replace(/\/+$/, '')}/v1`;
-  const hermesYaml = `# 007 Q-Branch Portable Configuration
-_config_version: 52
-model:
-  default: "${primaryModel}"
-  provider: "custom"
-  base_url: "${hermesApiUrl}"
-  api_key: "${currentKey}"
-runtime:
-  nofile_soft_limit: 4096
-tools:
-  tool_search:
-    enabled: "off"
-`;
-  fs.writeFileSync(path.join(targetPath, 'config', 'hermes', 'config.yaml'), hermesYaml, 'utf8');
-
-  const hermesEnv = `# 007 Q-Branch Portable Environment
-OPENAI_API_KEY=${currentKey}
-OPENAI_BASE_URL=${hermesApiUrl}
-CUSTOM_API_KEY=${currentKey}
-`;
-  fs.writeFileSync(path.join(targetPath, 'config', 'hermes', '.env'), hermesEnv, 'utf8');
-  console.log(`  ${C.green}✓ API keys connected & isolated to USB storage.${C.reset}\n`);
+  writePortableHermesFiles(path.join(targetPath, 'config', 'hermes'), {
+    primaryModel,
+    fastModel,
+    baseUrl: hermesApiUrl,
+    apiKey: currentKey,
+    typesafeBase: typesafeUrl
+  });
+  console.log(`  ${C.green}✓ API keys, Jev MCP & 2-model split isolated to USB storage.${C.reset}\n`);
 
   // Phase 6: Skills Deployment & Launcher Deployment
-  console.log(`${C.gold}[6/6] Transferring 44 Special Ops skills & Mission Launcher...${C.reset}`);
+  console.log(`${C.gold}[6/6] Transferring Special Ops skills (incl. jev-use) & Mission Launcher...${C.reset}`);
   
   const skillsSrcDir = fs.existsSync(LOCAL_SKILLS_PATH) ? LOCAL_SKILLS_PATH : GEMINI_SKILLS_PATH;
   let copiedSkillsCount = 0;
@@ -1577,11 +1931,9 @@ This USB drive contains a **100% self-contained AI Agent Command Center**.
 You can plug this drive into **ANY Windows PC** and start coding immediately.
 
 ### What is on this drive?
-* **Zero Host Requirements:** Node.js, npm, Claude Code, and Hermes runners are bundled directly on this drive in \`runtime/\`. The host computer needs **nothing installed**.
-* **Pre-Connected API Keys:** Pre-configured with the **Experiential Labs zero-cost promotional tier** (\`$0.00\` billing):
-  * **GPT-6 Luna** (Flagship Coding Agent)
-  * **DeepSeek V4.1 Flash 1017** (Ultra-Fast Aux / Subagent)
-* **Pre-Loaded Skills:** All **${copiedSkillsCount} Special Ops Skills** are pre-loaded for both Claude Code and Hermes Agent.
+* **Zero Host Requirements:** Node.js, npm, Claude Code, Jev Intervention (\`jev-use\`), and Hermes runners are bundled directly on this drive in \`runtime/\`. The host computer needs **nothing installed**.
+* **Pre-Connected API Keys & 2-Model Team:** Configured for **${primaryModel}** (Primary) + **${fastModel}** (Fast/Subagent) plus **Jev & Clef** zero-output-cost judgment tools.
+* **Pre-Loaded Skills:** All **${copiedSkillsCount} Special Ops Skills** (including \`jev-use\`) are pre-loaded for both Claude Code and Hermes Agent.
 * **100% Private & Isolated:** All user profiles, session histories, chat logs, and caches are written strictly to \`data/\` on this drive. **Zero traces or files are left on the host PC.**
 
 ---
@@ -1593,6 +1945,8 @@ You can plug this drive into **ANY Windows PC** and start coding immediately.
 4. Choose your agent from the mission menu:
    * \`[1]\` Claude Code
    * \`[2]\` Hermes Agent
+   * \`[H]\` Hermes Modes & Split
+   * \`[J]\` Jev Intervention & Gate
    * \`[K]\` Skills Arsenal
    * \`[U]\` Update Portable Suite
 
@@ -1614,15 +1968,467 @@ To update Claude Code, Hermes, or Skills directly on this USB stick without touc
   console.log(`${C.cyan}║${C.reset}  ${C.gold}🎉 MISSION SUCCESS: PORTABLE USB DRIVE ARMED & READY!${C.reset}                      ${C.cyan}║${C.reset}`);
   console.log(`${C.cyan}╚════════════════════════════════════════════════════════════════════════════╝${C.reset}`);
   console.log(`  ${C.gray}Location         :${C.reset} ${C.white}${targetPath}${C.reset}`);
-  console.log(`  ${C.gray}Payload Status   :${C.reset} ${C.green}Standalone Runtime + Full Arsenal Active${C.reset}`);
-  console.log(`  ${C.gray}Primary Model    :${C.reset} ${C.gold}${primaryModel}${C.reset} ${C.green}[$0.00 Free Tier]${C.reset}`);
-  console.log(`  ${C.gray}Auxiliary Model  :${C.reset} ${C.cyan}${fastModel}${C.reset} ${C.green}[$0.00 Free Tier]${C.reset}`);
+  console.log(`  ${C.gray}Payload Status   :${C.reset} ${C.green}Standalone Runtime + Jev + Full Arsenal Active${C.reset}`);
+  console.log(`  ${C.gray}Primary Model    :${C.reset} ${C.gold}${primaryModel}${C.reset}`);
+  console.log(`  ${C.gray}Subagent Model   :${C.reset} ${C.cyan}${fastModel}${C.reset}`);
   console.log(`  ${C.gray}Skills Loaded    :${C.reset} ${C.magenta}${copiedSkillsCount} combat skills deployed${C.reset}`);
   console.log(`  ${C.gray}Host Footprint   :${C.reset} ${C.green}0% (Zero files, registry keys or logs left on host)${C.reset}`);
   console.log(`  ${C.gray}Next Step        :${C.reset} ${C.white}Plug into any Windows machine and double-click 'Launch Agent.bat'.${C.reset}`);
   console.log(`${C.cyan}════════════════════════════════════════════════════════════════════════════${C.reset}\n`);
 
   await ask(`Press Enter to return to Q-Branch menu... `);
+}
+
+function syncJevIntegration({ apiKey = null, baseUrl = null, toggleGate = null, allowNpmInstall = false } = {}) {
+  const settings = readClaudeSettings();
+  settings.env = settings.env || {};
+  const resolvedKey = apiKey || settings.env.ANTHROPIC_AUTH_TOKEN || '';
+  const rawBase = baseUrl || settings.env.ANTHROPIC_BASE_URL || 'https://api.experientiallabs.ai';
+  const resolvedBase = rawBase.replace(/\/v1\/?$/, '').replace(/\/+$/, '');
+
+  // 1. Ensure local jev-use bundle so MCP & hooks start in <50ms without npm latency
+  const usbRoot = process.env.USB_ROOT;
+  const primaryBundleTarget = (IS_PORTABLE_MODE && usbRoot)
+    ? path.join(usbRoot, 'runtime', 'jev-use')
+    : path.join(USER_HOME, '.claude', 'jev-use');
+  ensureLocalJevBundle(primaryBundleTarget, allowNpmInstall);
+  const inv = resolveJevInvocation(primaryBundleTarget);
+
+  // 2. Wire Claude Code settings.env + permissions.allow + optional PreToolUse gate
+  if (resolvedKey) settings.env.TYPESAFE_API_KEY = resolvedKey;
+  settings.env.TYPESAFE_BASE_URL = resolvedBase;
+  settings.permissions = settings.permissions || {};
+  const allowSet = new Set(Array.isArray(settings.permissions.allow) ? settings.permissions.allow : []);
+  for (const rule of JEV_GATE_ALLOW_RULES) allowSet.add(rule);
+  settings.permissions.allow = [...allowSet];
+
+  if (toggleGate !== null) {
+    setJevGateEnabled(settings, toggleGate, inv.hookCommand);
+  } else if (getJevGateStatus(settings)) {
+    setJevGateEnabled(settings, true, inv.hookCommand);
+  }
+  saveClaudeSettings(settings);
+
+  // 3. Wire Claude Code ~/.claude.json (+ portable CLAUDE_CONFIG_DIR/.claude.json)
+  for (const cj of getClaudeJsonPaths()) {
+    const cfg = readJsonSafe(cj, {});
+    const mcp = cfg.mcpServers || {};
+    mcp.jev = {
+      type: 'stdio',
+      command: inv.command,
+      args: inv.args,
+      env: {
+        TYPESAFE_API_KEY: resolvedKey,
+        TYPESAFE_BASE_URL: resolvedBase
+      }
+    };
+    cfg.mcpServers = mcp;
+    writeJsonSafe(cj, cfg);
+  }
+
+  // 4. Deploy jev-use skill to Claude & WSL Hermes
+  const jevSkillSrc = resolveSkillPath('jev-use');
+  if (jevSkillSrc && fs.existsSync(jevSkillSrc)) {
+    const claudeSkillDir = process.env.CLAUDE_CONFIG_DIR
+      ? path.join(process.env.CLAUDE_CONFIG_DIR, 'skills', 'jev-use')
+      : path.join(CLAUDE_SKILLS_PATH, 'jev-use');
+    safeCopyDir(jevSkillSrc, claudeSkillDir);
+    if (!IS_PORTABLE_MODE && fs.existsSync(WSL_HERMES_CONFIG_UNC)) {
+      runWsl(`mkdir -p /home/Ade/.hermes/skills/vault/jev-use && cp -r "${toWslPath(jevSkillSrc)}/." /home/Ade/.hermes/skills/vault/jev-use/`);
+    }
+  }
+
+  // 5. Sync WSL Hermes (install jev-use if absent + write mcp_servers.jev & .env)
+  if (!IS_PORTABLE_MODE && fs.existsSync(WSL_HERMES_CONFIG_UNC)) {
+    runWsl('if [ ! -f /home/Ade/.hermes/tools/jev-use/node_modules/jev-use/dist/cli.js ]; then mkdir -p /home/Ade/.hermes/tools/jev-use && npm --prefix /home/Ade/.hermes/tools/jev-use install --no-save jev-use@0.8.0 >/dev/null 2>&1 || true; fi');
+    runWslHermesPython({
+      env: {
+        ...(resolvedKey ? { TYPESAFE_API_KEY: resolvedKey } : {}),
+        TYPESAFE_BASE_URL: resolvedBase
+      },
+      wireJevMcp: true
+    });
+  }
+
+  // 6. Sync / mirror USB Portable suite if USB_ROOT is attached or active
+  if (usbRoot && fs.existsSync(usbRoot)) {
+    const usbJevBundle = path.join(usbRoot, 'runtime', 'jev-use');
+    ensureLocalJevBundle(usbJevBundle, allowNpmInstall);
+    const usbCli = path.join(usbJevBundle, 'node_modules', 'jev-use', 'dist', 'cli.js');
+    const usbNode = path.join(usbRoot, 'runtime', 'node', 'node.exe');
+    const usbCmd = fs.existsSync(usbNode) ? usbNode : 'node';
+    const usbHook = fs.existsSync(usbCli) ? `node "${usbCli}" hook gate` : inv.hookCommand;
+
+    if (jevSkillSrc && fs.existsSync(jevSkillSrc)) {
+      safeCopyDir(jevSkillSrc, path.join(usbRoot, 'skills', 'jev-use'));
+      safeCopyDir(jevSkillSrc, path.join(usbRoot, 'config', 'claude', 'skills', 'jev-use'));
+      safeCopyDir(jevSkillSrc, path.join(usbRoot, 'config', 'hermes', 'skills', 'vault', 'jev-use'));
+      safeCopyDir(jevSkillSrc, path.join(usbRoot, 'data', 'home', '.claude', 'skills', 'jev-use'));
+    }
+
+    for (const sPath of [
+      path.join(usbRoot, 'config', 'claude', 'settings.json'),
+      path.join(usbRoot, 'data', 'home', '.claude', 'settings.json')
+    ]) {
+      const usbS = readJsonSafe(sPath, { env: {}, permissions: {}, modelSettings: {} });
+      usbS.env = usbS.env || {};
+      if (resolvedKey) usbS.env.TYPESAFE_API_KEY = resolvedKey;
+      usbS.env.TYPESAFE_BASE_URL = resolvedBase;
+      usbS.permissions = usbS.permissions || {};
+      const usbAllow = new Set(Array.isArray(usbS.permissions.allow) ? usbS.permissions.allow : []);
+      for (const rule of JEV_GATE_ALLOW_RULES) usbAllow.add(rule);
+      usbS.permissions.allow = [...usbAllow];
+      setJevGateEnabled(usbS, getJevGateStatus(settings), usbHook);
+      writeJsonSafe(sPath, usbS);
+    }
+
+    for (const cjPath of [
+      path.join(usbRoot, 'config', 'claude', '.claude.json'),
+      path.join(usbRoot, 'data', 'home', '.claude.json')
+    ]) {
+      const usbCj = readJsonSafe(cjPath, {});
+      usbCj.mcpServers = usbCj.mcpServers || {};
+      usbCj.mcpServers.jev = {
+        type: 'stdio',
+        command: usbCmd,
+        args: fs.existsSync(usbCli) ? [usbCli, 'serve'] : ['-y', 'jev-use@0.8.0', 'serve'],
+        env: {
+          TYPESAFE_API_KEY: resolvedKey,
+          TYPESAFE_BASE_URL: resolvedBase
+        }
+      };
+      writeJsonSafe(cjPath, usbCj);
+    }
+
+    writePortableHermesFiles(path.join(usbRoot, 'config', 'hermes'), {
+      baseUrl: `${resolvedBase}/v1`,
+      apiKey: resolvedKey,
+      typesafeBase: resolvedBase
+    });
+    fs.writeFileSync(
+      path.join(usbRoot, 'config', 'claude', '.usb_root.txt'),
+      usbRoot.endsWith(path.sep) ? usbRoot : `${usbRoot}${path.sep}`,
+      'utf8'
+    );
+  }
+
+  return { resolvedBase, hasKey: Boolean(resolvedKey), inv, gateEnabled: getJevGateStatus(settings) };
+}
+
+function extractTopLevelYamlSection(raw, sectionKey) {
+  const lines = raw.split(/\r?\n/);
+  const captured = [];
+  let inSection = false;
+  for (const line of lines) {
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    if (/^\S/.test(line)) {
+      if (inSection) break;
+      if (line.trim() === `${sectionKey}:`) inSection = true;
+      continue;
+    }
+    if (inSection) captured.push(line);
+  }
+  return captured.join('\n');
+}
+
+function inspectJevState() {
+  const settings = readClaudeSettings();
+  const env = settings.env || {};
+  let jevMcp = null;
+  for (const p of getClaudeJsonPaths()) {
+    const cj = readJsonSafe(p, {});
+    if (cj?.mcpServers?.jev) {
+      jevMcp = cj.mcpServers.jev;
+      break;
+    }
+  }
+  const hasMcp = Boolean(jevMcp);
+  const hasMcpKey = Boolean(jevMcp?.env?.TYPESAFE_API_KEY || env.TYPESAFE_API_KEY);
+  const allow = Array.isArray(settings.permissions?.allow) ? settings.permissions.allow : [];
+  const hasAllow = JEV_GATE_ALLOW_RULES.every(r => allow.includes(r));
+  const gateOn = getJevGateStatus(settings);
+  const claudeSkillPath = path.join(
+    process.env.CLAUDE_CONFIG_DIR ? path.join(process.env.CLAUDE_CONFIG_DIR, 'skills') : CLAUDE_SKILLS_PATH,
+    'jev-use', 'SKILL.md'
+  );
+  const hasSkill = fs.existsSync(claudeSkillPath);
+
+  let hermesJev = false;
+  try {
+    const cfgPath = IS_PORTABLE_MODE && process.env.USB_ROOT
+      ? path.join(process.env.USB_ROOT, 'config', 'hermes', 'config.yaml')
+      : WSL_HERMES_CONFIG_UNC;
+    if (fs.existsSync(cfgPath)) {
+      const mcpBlock = extractTopLevelYamlSection(fs.readFileSync(cfgPath, 'utf8'), 'mcp_servers');
+      hermesJev = /^\s+jev:/m.test(mcpBlock);
+    }
+  } catch (e) {}
+
+  return {
+    hasMcp,
+    hasMcpKey,
+    hasAllow,
+    gateOn,
+    hasSkill,
+    hermesJev,
+    baseUrl: jevMcp?.env?.TYPESAFE_BASE_URL || env.TYPESAFE_BASE_URL || env.ANTHROPIC_BASE_URL || 'https://api.experientiallabs.ai',
+    apiKey: jevMcp?.env?.TYPESAFE_API_KEY || env.TYPESAFE_API_KEY || env.ANTHROPIC_AUTH_TOKEN || '',
+    commandDesc: jevMcp ? `${jevMcp.command} ${(jevMcp.args || []).join(' ')}` : 'Not registered'
+  };
+}
+
+async function testJevLive(apiKey, baseUrl) {
+  if (!apiKey) {
+    return [{ model: 'jev-latest', ok: false, error: 'Missing API key' }];
+  }
+  const origin = baseUrl.replace(/\/v1\/?$/, '').replace(/\/+$/, '');
+  const results = [];
+  for (const model of ['jev-latest', 'clef']) {
+    const t0 = Date.now();
+    try {
+      const res = await fetch(`${origin}/v1/systemone`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model,
+          state: 'Q-Branch diagnostic probe: system ready OK.',
+          questions: {
+            ready: { type: 'noul', instructions: 'Does this state indicate the system is ready OK?' }
+          }
+        })
+      });
+      const ms = Date.now() - t0;
+      if (!res.ok) {
+        const errTxt = (await res.text()).slice(0, 120);
+        results.push({ model, ok: false, ms, error: `HTTP ${res.status}: ${errTxt}` });
+      } else {
+        const data = await res.json();
+        const ans = data?.answers?.ready?.noul;
+        results.push({ model, ok: true, ms, score: ans });
+      }
+    } catch (e) {
+      results.push({ model, ok: false, ms: Date.now() - t0, error: e.message });
+    }
+  }
+  return results;
+}
+
+async function manageJev() {
+  while (true) {
+    console.clear();
+    const st = inspectJevState();
+    console.log(`${C.cyan}╔════════════════════════════════════════════════════════════════════════════╗${C.reset}`);
+    console.log(`${C.cyan}║${C.reset}  ${C.gold}007 Q-BRANCH : JEV & CLEF SYSTEM-1 INTERVENTION CONSOLE${C.reset}                   ${C.cyan}║${C.reset}`);
+    console.log(`${C.cyan}╚════════════════════════════════════════════════════════════════════════════╝${C.reset}`);
+    console.log(`  ${C.gray}Endpoint Origin    :${C.reset} ${C.white}${st.baseUrl}${C.reset}`);
+    console.log(`  ${C.gray}Claude MCP (jev)   :${C.reset} ${st.hasMcp && st.hasMcpKey ? `${C.green}✓ ACTIVE${C.reset} ${C.gray}(${st.commandDesc})${C.reset}` : st.hasMcp ? `${C.red}✗ REGISTERED BUT NO API KEY${C.reset}` : `${C.red}✗ NOT CONFIGURED${C.reset}`}`);
+    console.log(`  ${C.gray}Claude Permissions :${C.reset} ${st.hasAllow ? `${C.green}✓ mcp__jev__jev_judge & jev_gate allowed${C.reset}` : `${C.gold}! Explicit allow rules missing${C.reset}`}`);
+    console.log(`  ${C.gray}PreToolUse Gate    :${C.reset} ${st.gateOn ? `${C.green}✓ ENABLED${C.reset} ${C.gray}(Zero-token risk check before Bash/Write/Edit)${C.reset}` : `${C.gray}OFF (Use [2] to enable automatic shell/edit safety gate)${C.reset}`}`);
+    console.log(`  ${C.gray}Hermes MCP (jev)   :${C.reset} ${st.hermesJev ? `${C.green}✓ ENABLED${C.reset}` : `${C.red}✗ NOT CONFIGURED${C.reset}`}`);
+    console.log(`  ${C.gray}Routing Skill      :${C.reset} ${st.hasSkill ? `${C.green}✓ jev-use SKILL.md deployed${C.reset}` : `${C.gold}! jev-use skill not installed in active dir${C.reset}`}`);
+    console.log(`${C.cyan}────────────────────────────────────────────────────────────────────────────${C.reset}\n`);
+
+    console.log(`  ${C.green}[1]${C.reset} ${C.white}Auto-Wire / Repair All${C.reset}      ${C.gray}- Configure Claude, Hermes, Key, Permissions & Skill${C.reset}`);
+    console.log(`  ${C.gold}[2]${C.reset} ${C.white}Toggle PreToolUse Gate${C.reset}     ${C.gray}- Currently ${st.gateOn ? 'ON' : 'OFF'} (Zero-token Bash/Write/Edit vetting)${C.reset}`);
+    console.log(`  ${C.cyan}[3]${C.reset} ${C.white}Live Latency Test${C.reset}          ${C.gray}- Probe jev-latest & clef on /v1/systemone${C.reset}`);
+    console.log(`  ${C.red}[0]${C.reset} ${C.white}Return to Main Menu${C.reset}\n`);
+
+    const c = (await ask(`Select action [1-3, 0]: `)).trim().toLowerCase();
+    if (!c || c === '0' || c === 'q' || c === 'b') break;
+
+    if (c === '1') {
+      console.log(`\n[*] Wiring Jev Intervention across Claude Code, Hermes & Skills...`);
+      syncJevIntegration({ allowNpmInstall: true });
+      console.log(`${C.green}✓ All Jev configurations synchronized!${C.reset}`);
+      await ask(`Press Enter to continue... `);
+    } else if (c === '2') {
+      const nextState = !st.gateOn;
+      syncJevIntegration({ toggleGate: nextState });
+      console.log(`\n${C.green}✓ PreToolUse Safety Gate is now ${nextState ? 'ENABLED' : 'DISABLED'}.${C.reset}`);
+      await ask(`Press Enter to continue... `);
+    } else if (c === '3') {
+      console.log(`\n[*] Testing live /v1/systemone round-trips...`);
+      const res = await testJevLive(st.apiKey, st.baseUrl);
+      for (const r of res) {
+        if (r.ok) {
+          console.log(`  ${C.green}✓ ${r.model.padEnd(12)}${C.reset} ${C.white}${r.ms}ms${C.reset} ${C.gray}(noul score: ${Number(r.score).toFixed(3)})${C.reset}`);
+        } else {
+          console.log(`  ${C.red}✗ ${r.model.padEnd(12)}${C.reset} ${r.error}`);
+        }
+      }
+      console.log();
+      await ask(`Press Enter to continue... `);
+    }
+  }
+}
+
+function readHermesYamlSummary() {
+  const cfgPath = IS_PORTABLE_MODE && process.env.USB_ROOT
+    ? path.join(process.env.USB_ROOT, 'config', 'hermes', 'config.yaml')
+    : WSL_HERMES_CONFIG_UNC;
+  const info = {
+    exists: false,
+    defaultModel: 'unknown',
+    delegationModel: '(inherits primary)',
+    reasoningEffort: 'none',
+    serviceTier: 'normal',
+    hasJevMcp: false
+  };
+  try {
+    if (!fs.existsSync(cfgPath)) return info;
+    const raw = fs.readFileSync(cfgPath, 'utf8');
+    info.exists = true;
+    const modelBlock = extractTopLevelYamlSection(raw, 'model');
+    info.defaultModel = modelBlock.match(/^\s+default:\s*"?([^"\r\n#]+)"?/m)?.[1]?.trim() || info.defaultModel;
+    const delBlock = extractTopLevelYamlSection(raw, 'delegation');
+    const delMod = delBlock.match(/^\s+model:\s*"?([^"\r\n#]+)"?/m)?.[1]?.trim();
+    if (delMod) info.delegationModel = delMod;
+    const agentBlock = extractTopLevelYamlSection(raw, 'agent');
+    const rEff = agentBlock.match(/^\s+reasoning_effort:\s*"?([^"\r\n#]+)"?/m)?.[1]?.trim();
+    if (rEff) info.reasoningEffort = rEff;
+    const sTier = agentBlock.match(/^\s+service_tier:\s*"?([^"\r\n#]*)"?/m)?.[1]?.trim();
+    if (sTier) info.serviceTier = sTier;
+    const mcpBlock = extractTopLevelYamlSection(raw, 'mcp_servers');
+    info.hasJevMcp = /^\s+jev:/m.test(mcpBlock);
+  } catch (e) {}
+  return info;
+}
+
+async function manageHermesModes() {
+  const launchTmp = path.join(os.tmpdir(), 'qbranch_hermes_launch.txt');
+  while (true) {
+    console.clear();
+    const settings = readClaudeSettings();
+    const qPrimary = settings.env?.ANTHROPIC_MODEL || 'gpt-6-luna';
+    const qFast = settings.env?.ANTHROPIC_DEFAULT_HAIKU_MODEL || 'deepseek-v4.1-flash-1017';
+    const h = readHermesYamlSummary();
+
+    console.log(`${C.cyan}╔════════════════════════════════════════════════════════════════════════════╗${C.reset}`);
+    console.log(`${C.cyan}║${C.reset}  ${C.gold}007 Q-BRANCH : HERMES MODES, MULTI-MODEL SPLIT & LAUNCHES${C.reset}                 ${C.cyan}║${C.reset}`);
+    console.log(`${C.cyan}╚════════════════════════════════════════════════════════════════════════════╝${C.reset}`);
+    console.log(`  ${C.gray}Primary Model      :${C.reset} ${C.gold}${h.defaultModel}${C.reset}`);
+    console.log(`  ${C.gray}Subagent Model     :${C.reset} ${C.cyan}${h.delegationModel}${C.reset} ${C.gray}(delegation.model)${C.reset}`);
+    console.log(`  ${C.gray}Reasoning Effort   :${C.reset} ${C.white}${h.reasoningEffort}${C.reset} ${C.gray}(none | low | medium | high | xhigh)${C.reset}`);
+    console.log(`  ${C.gray}Fast Service Tier  :${C.reset} ${C.white}${h.serviceTier || 'normal'}${C.reset}`);
+    console.log(`  ${C.gray}Jev MCP Tools      :${C.reset} ${h.hasJevMcp ? `${C.green}✓ jev_judge & jev_gate loaded${C.reset}` : `${C.red}✗ Not wired (run [J])${C.reset}`}`);
+    console.log(`${C.cyan}────────────────────────────────────────────────────────────────────────────${C.reset}`);
+    console.log(`  ${C.gold}CONFIGURE HERMES DEFAULTS:${C.reset}`);
+    console.log(`  ${C.green}[1]${C.reset} ${C.white}Sync 2-Model Split${C.reset}        ${C.gray}(Primary: ${qPrimary} + Subagent: ${qFast})${C.reset}`);
+    console.log(`  ${C.green}[2]${C.reset} ${C.white}Set Subagent Model${C.reset}        ${C.gray}- Choose dedicated model for spawned child agents${C.reset}`);
+    console.log(`  ${C.green}[3]${C.reset} ${C.white}Set Reasoning Effort${C.reset}      ${C.gray}- Change thinking depth (none / low / medium / high / xhigh)${C.reset}`);
+    console.log(`\n  ${C.cyan}LAUNCH HERMES IN SPECIAL MODES (CURRENT FOLDER):${C.reset}`);
+    console.log(`  ${C.cyan}[4]${C.reset} ${C.white}Resume Latest Session${C.reset}     ${C.gray}(--resume latest)${C.reset}`);
+    console.log(`  ${C.cyan}[5]${C.reset} ${C.white}Git Worktree Isolation${C.reset}    ${C.gray}(--worktree — isolated branch workspace)${C.reset}`);
+    console.log(`  ${C.cyan}[6]${C.reset} ${C.white}TUI + High Reasoning${C.reset}      ${C.gray}(--tui --reasoning high)${C.reset}`);
+    console.log(`  ${C.cyan}[7]${C.reset} ${C.white}YOLO + TUI${C.reset}                ${C.gray}(--tui --yolo — dashboard with auto-approve)${C.reset}`);
+    console.log(`  ${C.red}[0]${C.reset} ${C.white}Return to Main Menu${C.reset}\n`);
+
+    const c = (await ask(`Select option [1-7, 0]: `)).trim().toLowerCase();
+    if (!c || c === '0' || c === 'q' || c === 'b') break;
+
+    if (c === '1') {
+      syncToHermes(qPrimary, settings.env?.ANTHROPIC_BASE_URL, settings.env?.ANTHROPIC_AUTH_TOKEN, qFast);
+      console.log(`${C.green}✓ Synced Primary (${qPrimary}) + Subagent (${qFast}) to Hermes!${C.reset}`);
+      await ask(`Press Enter to continue... `);
+    } else if (c === '2') {
+      const sub = (await ask(`Enter delegation.model (e.g. deepseek-v4.1-flash-1017, blank = inherit parent): `)).trim();
+      if (!IS_PORTABLE_MODE && fs.existsSync(WSL_HERMES_CONFIG_UNC)) {
+        runWslHermesPython({ fastModel: sub });
+      }
+      if (process.env.USB_ROOT && fs.existsSync(process.env.USB_ROOT)) {
+        writePortableHermesFiles(path.join(process.env.USB_ROOT, 'config', 'hermes'), { fastModel: sub });
+      }
+      console.log(`${C.green}✓ Hermes delegation.model updated!${C.reset}`);
+      await ask(`Press Enter to continue... `);
+    } else if (c === '3') {
+      const lvl = (await ask(`Enter reasoning effort [none|minimal|low|medium|high|xhigh]: `)).trim().toLowerCase();
+      if (['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(lvl)) {
+        if (!IS_PORTABLE_MODE && fs.existsSync(WSL_HERMES_CONFIG_UNC)) {
+          runWslHermesPython({ reasoning: lvl });
+        }
+        if (process.env.USB_ROOT && fs.existsSync(process.env.USB_ROOT)) {
+          writePortableHermesFiles(path.join(process.env.USB_ROOT, 'config', 'hermes'), { reasoning: lvl });
+        }
+        console.log(`${C.green}✓ Reasoning effort set to "${lvl}".${C.reset}`);
+      } else {
+        console.log(`${C.red}Invalid reasoning level.${C.reset}`);
+      }
+      await ask(`Press Enter to continue... `);
+    } else if (c === '4') {
+      fs.writeFileSync(launchTmp, '--resume latest', 'utf8');
+      break;
+    } else if (c === '5') {
+      fs.writeFileSync(launchTmp, '--worktree', 'utf8');
+      break;
+    } else if (c === '6') {
+      fs.writeFileSync(launchTmp, '--tui --reasoning high', 'utf8');
+      break;
+    } else if (c === '7') {
+      fs.writeFileSync(launchTmp, '--tui --yolo', 'utf8');
+      break;
+    }
+  }
+}
+
+function printEnvSummary() {
+  const settings = readClaudeSettings();
+  const env = settings.env || {};
+  const primary = env.ANTHROPIC_MODEL || 'gpt-6-luna';
+  const fast = env.ANTHROPIC_DEFAULT_HAIKU_MODEL || 'deepseek-v4.1-flash-1017';
+  let hasClaudeJev = false;
+  for (const p of getClaudeJsonPaths()) {
+    const cj = readJsonSafe(p, {});
+    if (cj?.mcpServers?.jev && (cj?.mcpServers?.jev?.env?.TYPESAFE_API_KEY || env.TYPESAFE_API_KEY)) {
+      hasClaudeJev = true;
+      break;
+    }
+  }
+  const gate = getJevGateStatus(settings) ? 'ON' : 'OFF';
+  console.log(`Q_PRIMARY=${primary}`);
+  console.log(`Q_FAST=${fast}`);
+  console.log(`Q_JEV_STATUS=${hasClaudeJev ? 'ACTIVE' : 'UNCONFIGURED'}`);
+  console.log(`Q_JEV_GATE=${gate}`);
+}
+
+function refreshUsbPaths(usbRootInput) {
+  const usbRoot = path.resolve(usbRootInput || SCRIPT_DIR);
+  const cliJs = path.join(usbRoot, 'runtime', 'jev-use', 'node_modules', 'jev-use', 'dist', 'cli.js');
+  const nodeExe = path.join(usbRoot, 'runtime', 'node', 'node.exe');
+  if (!fs.existsSync(cliJs)) return;
+
+  for (const cjPath of [
+    path.join(usbRoot, 'config', 'claude', '.claude.json'),
+    path.join(usbRoot, 'data', 'home', '.claude.json')
+  ]) {
+    if (!fs.existsSync(cjPath)) continue;
+    const cfg = readJsonSafe(cjPath, {});
+    if (cfg?.mcpServers?.jev) {
+      cfg.mcpServers.jev.command = fs.existsSync(nodeExe) ? nodeExe : 'node';
+      cfg.mcpServers.jev.args = [cliJs, 'serve'];
+      writeJsonSafe(cjPath, cfg);
+    }
+  }
+
+  for (const sPath of [
+    path.join(usbRoot, 'config', 'claude', 'settings.json'),
+    path.join(usbRoot, 'data', 'home', '.claude', 'settings.json')
+  ]) {
+    if (!fs.existsSync(sPath)) continue;
+    const s = readJsonSafe(sPath, {});
+    if (getJevGateStatus(s)) {
+      setJevGateEnabled(s, true, `node "${cliJs}" hook gate`);
+      writeJsonSafe(sPath, s);
+    }
+  }
+  const usbHermesDir = path.join(usbRoot, 'config', 'hermes');
+  if (fs.existsSync(path.join(usbHermesDir, 'config.yaml'))) {
+    writePortableHermesFiles(usbHermesDir, {});
+  }
+  fs.mkdirSync(path.join(usbRoot, 'config', 'claude'), { recursive: true });
+  fs.writeFileSync(path.join(usbRoot, 'config', 'claude', '.usb_root.txt'), usbRoot.endsWith(path.sep) ? usbRoot : `${usbRoot}${path.sep}`, 'utf8');
 }
 
 // CLI Router
@@ -1633,10 +2439,18 @@ const currentDir = process.cwd();
 try {
   if (cmd === 'status') {
     await showStatus();
+  } else if (cmd === 'env-summary') {
+    printEnvSummary();
+  } else if (cmd === 'refresh-usb-paths') {
+    refreshUsbPaths(args[1]);
   } else if (cmd === 'config') {
     await configureApi();
   } else if (cmd === 'models') {
     await browseModels();
+  } else if (cmd === 'jev') {
+    await manageJev();
+  } else if (cmd === 'hermes-modes' || cmd === 'hermes') {
+    await manageHermesModes();
   } else if (cmd === 'skills') {
     await manageSkills(currentDir);
   } else if (cmd === 'profiles' || cmd === 'loadouts') {

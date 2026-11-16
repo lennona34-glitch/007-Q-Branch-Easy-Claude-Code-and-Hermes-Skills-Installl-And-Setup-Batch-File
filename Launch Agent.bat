@@ -4,7 +4,7 @@ title Q-BRANCH AGENT HUB (007 License to Code)
 color 0b
 
 :: Initialize ANSI VT100 Escape Sequence for true terminal color
-for /f "delims=" %%a in ('powershell -NoProfile -Command "[char]27"') do set "ESC=%%a"
+for /f "delims=" %%a in ('powershell -InputFormat None -NoProfile -Command "[char]27"') do set "ESC=%%a"
 
 :: Define ANSI color presets
 set "C_RESET=%ESC%[0m"
@@ -29,6 +29,8 @@ if /i "%~1"=="hermes" set "IS_CMD_ARG=1"
 if /i "%~1"=="hermes-tui" set "IS_CMD_ARG=1"
 if /i "%~1"=="hermes-deepseek" set "IS_CMD_ARG=1"
 if /i "%~1"=="hermes-yolo" set "IS_CMD_ARG=1"
+if /i "%~1"=="hermes-modes" set "IS_CMD_ARG=1"
+if /i "%~1"=="jev" set "IS_CMD_ARG=1"
 if /i "%~1"=="setup" set "IS_CMD_ARG=1"
 if /i "%~1"=="install" set "IS_CMD_ARG=1"
 if /i "%~1"=="usb" set "IS_CMD_ARG=1"
@@ -124,6 +126,7 @@ if "!IS_PORTABLE!"=="1" (
     set "ANTHROPIC_BASE_URL=https://api.experientiallabs.ai"
     set "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1"
     set "CLAUDE_CODE_AUTO_MODE_SERVER=0"
+    set "QBRANCH_PORTABLE=1"
     set "QBRANCH_SCRIPT=!USB_ROOT!qbranch.mjs"
 ) else (
     set "PATH=%SystemRoot%\system32;%SystemRoot%;C:\Program Files\nodejs;C:\Program Files\Git\cmd;%LOCALAPPDATA%\Programs\Python\Python312;%PATH%"
@@ -136,6 +139,17 @@ if "!IS_PORTABLE!"=="1" (
     )
 )
 
+set "Q_PRIMARY=gpt-6-luna"
+set "Q_FAST=deepseek-v4.1-flash-1017"
+set "Q_JEV_STATUS=CHECKING"
+set "Q_JEV_GATE=OFF"
+
+if not "!IS_PORTABLE!"=="1" goto :after_usb_paths
+set "OLD_USB_ROOT="
+if exist "!USB_ROOT!config\claude\.usb_root.txt" set /p OLD_USB_ROOT=<"!USB_ROOT!config\claude\.usb_root.txt"
+if /i not "!OLD_USB_ROOT!"=="!USB_ROOT!" node "!QBRANCH_SCRIPT!" refresh-usb-paths "!USB_ROOT!" >nul 2>nul
+:after_usb_paths
+
 :: ----------------------------------------------------------------------------
 :: 3. Command-Line Argument Dispatching
 :: ----------------------------------------------------------------------------
@@ -145,6 +159,8 @@ if /i "%~1"=="hermes" goto :run_hermes_luna
 if /i "%~1"=="hermes-tui" goto :run_hermes_tui
 if /i "%~1"=="hermes-deepseek" goto :run_hermes_deepseek
 if /i "%~1"=="hermes-yolo" goto :run_hermes_yolo
+if /i "%~1"=="hermes-modes" goto :run_hermes_modes
+if /i "%~1"=="jev" goto :run_jev
 if /i "%~1"=="setup" goto :run_setup
 if /i "%~1"=="install" goto :run_setup
 if /i "%~1"=="usb" goto :run_usb
@@ -159,6 +175,7 @@ if /i "%~1"=="pick" goto :pick_target
 
 :menu
 cls
+for /f "usebackq tokens=1,* delims==" %%A in (`node "%QBRANCH_SCRIPT%" env-summary 2^>nul`) do set "%%A=%%B"
 echo %C_CYAN%==============================================================================%C_RESET%
 echo %C_GOLD%      ___   ___  _____     ___        ___   ___    _   _  _  ___  _  _  %C_RESET%
 echo %C_GOLD%     / _ \ / _ \^|___  ^|   / _ \      ^| _ ) ^| _ \  /_\ ^| \^| ^|/ __^|^| ^|^| ^| %C_RESET%
@@ -173,14 +190,15 @@ if "!IS_DIRECT_USB!"=="1" echo  %C_GRAY%PRIVACY ISOLATION  :%C_RESET% %C_CYAN%10
 if "!IS_PORTABLE!"=="1" if "!IS_DIRECT_USB!"=="0" echo  %C_GRAY%DEPLOYMENT MODE    :%C_RESET% %C_GREEN%[HOST LINKED TO PORTABLE USB: !USB_ROOT!]%C_RESET%
 if "!IS_PORTABLE!"=="0"   echo  %C_GRAY%DEPLOYMENT MODE    :%C_RESET% %C_GREEN%[LOCAL HOST ENVIRONMENT (KALI WSL + HOST TOOLS)]%C_RESET%
 if "!IS_PORTABLE!"=="0" if defined USB_ROOT echo  %C_GRAY%USB SUITE ATTACHED :%C_RESET% %C_GOLD%!USB_ROOT! [Ready for sync or backup]%C_RESET%
-echo  %C_GRAY%GATEWAY            :%C_RESET% %C_CYAN%Experiential Labs (Promotional Free Tier: $0)%C_RESET%
-echo  %C_GRAY%ACTIVE COMBINATION :%C_RESET% %C_GOLD%GPT-6 Luna%C_RESET% %C_GREEN%[FREE]%C_RESET% + %C_CYAN%DeepSeek Flash 1017%C_RESET% %C_GREEN%[FREE]%C_RESET%
+echo  %C_GRAY%GATEWAY            :%C_RESET% %C_CYAN%Experiential Labs (Agent Gateway)%C_RESET%
+echo  %C_GRAY%ACTIVE TEAM        :%C_RESET% %C_GOLD%!Q_PRIMARY!%C_RESET% + %C_CYAN%!Q_FAST!%C_RESET%
+echo  %C_GRAY%JEV INTERVENTION   :%C_RESET% %C_GREEN%!Q_JEV_STATUS!%C_RESET% %C_GRAY%[PreToolUse Gate: %C_GOLD%!Q_JEV_GATE!%C_GRAY%]%C_RESET%
 echo %C_CYAN%==============================================================================%C_RESET%
 echo.
-echo   %C_GREEN%[1]%C_RESET% %C_WHITE%Claude Code%C_RESET%        %C_GRAY%- Tag-Team: GPT-6 Luna + DeepSeek Flash 1017%C_RESET%
-echo   %C_GREEN%[2]%C_RESET% %C_WHITE%Hermes Agent%C_RESET%       %C_GRAY%- Autonomous Agent (GPT-6 Luna)%C_RESET%
-echo   %C_GREEN%[3]%C_RESET% %C_WHITE%Hermes Agent (TUI)%C_RESET% %C_GRAY%- Full Visual Dashboard Interface%C_RESET%
-echo   %C_GREEN%[4]%C_RESET% %C_WHITE%Hermes Agent%C_RESET%       %C_GRAY%- Rapid Flash Mode (DeepSeek V4.1 Flash 1017)%C_RESET%
+echo   %C_GREEN%[1]%C_RESET% %C_WHITE%Claude Code%C_RESET%        %C_GRAY%- Primary: !Q_PRIMARY! + Fast: !Q_FAST!%C_RESET%
+echo   %C_GREEN%[2]%C_RESET% %C_WHITE%Hermes Agent%C_RESET%       %C_GRAY%- Synced Split [!Q_PRIMARY! + Subagent !Q_FAST!]%C_RESET%
+echo   %C_GREEN%[3]%C_RESET% %C_WHITE%Hermes Agent (TUI)%C_RESET% %C_GRAY%- Visual Dashboard Interface [!Q_PRIMARY!]%C_RESET%
+echo   %C_GREEN%[4]%C_RESET% %C_WHITE%Hermes Agent%C_RESET%       %C_GRAY%- Rapid Flash Override [DeepSeek V4.1 Flash 1017]%C_RESET%
 echo.
 echo   %C_GOLD%[5]%C_RESET% %C_WHITE%Claude Code (YOLO)%C_RESET% %C_GRAY%- Bypass Permission Prompts%C_RESET%
 echo   %C_GOLD%[6]%C_RESET% %C_WHITE%Hermes Agent (YOLO)%C_RESET%%C_GRAY%- Auto-Approve Command Execution%C_RESET%
@@ -193,11 +211,13 @@ if "!IS_PORTABLE!"=="0" echo   %C_GOLD%[U]%C_RESET% %C_WHITE%Portable USB Drive 
 echo   %C_MAGENTA%[P]%C_RESET% %C_WHITE%Mission Loadouts (Profiles)%C_RESET%%C_GRAY%- 1-Click Strike Team Swap (Special Ops / Restore)%C_RESET%
 echo   %C_MAGENTA%[K]%C_RESET% %C_WHITE%Skills Arsenal%C_RESET%            %C_GRAY%- Browse packs, search ^& deploy to project/globally%C_RESET%
 echo   %C_MAGENTA%[M]%C_RESET% %C_WHITE%Online Model Browser%C_RESET%       %C_GRAY%- Browse live gateway models, check Free tier ^& switch%C_RESET%
+echo   %C_MAGENTA%[H]%C_RESET% %C_WHITE%Hermes Modes ^& Split%C_RESET%      %C_GRAY%- Subagent model, reasoning, resume, worktree ^& TUI%C_RESET%
+echo   %C_MAGENTA%[J]%C_RESET% %C_WHITE%Jev Intervention ^& Gate%C_RESET%   %C_GRAY%- Status, live test ^& PreToolUse safety gate%C_RESET%
 echo   %C_MAGENTA%[S]%C_RESET% %C_WHITE%Gateway Settings%C_RESET%           %C_GRAY%- View/Update API Key and Gateway URL%C_RESET%
 echo.
 echo   %C_RED%[Q]%C_RESET% %C_WHITE%Q-Branch Signoff%C_RESET%           %C_GRAY%- Return to Base (Exit)%C_RESET%
 echo %C_CYAN%==============================================================================%C_RESET%
-set /p choice="%C_BOLD%Select an operation [1-6, W, I, U, P, K, M, S, Q] (Default is 1): %C_RESET%"
+set /p choice="%C_BOLD%Select an operation [1-6, W, I, U, P, K, M, H, J, S, Q] (Default is 1): %C_RESET%"
 
 if "%choice%"=="" set choice=1
 if /i "%choice%"=="q" goto :exit_007
@@ -213,6 +233,8 @@ if /i "%choice%"=="u" goto :run_usb
 if /i "%choice%"=="p" goto :run_profiles
 if /i "%choice%"=="k" goto :run_skills
 if /i "%choice%"=="m" goto :run_models
+if /i "%choice%"=="h" goto :run_hermes_modes
+if /i "%choice%"=="j" goto :run_jev
 if /i "%choice%"=="s" goto :run_settings
 
 echo %C_RED%Invalid option, please choose from the mission menu.%C_RESET%
@@ -349,11 +371,11 @@ goto :session_ended
 
 
 :run_hermes_luna
-set "HERMES_ARGS=-m gpt-6-luna"
+set "HERMES_ARGS="
 goto :exec_hermes
 
 :run_hermes_tui
-set "HERMES_ARGS=--tui -m gpt-6-luna"
+set "HERMES_ARGS=--tui"
 goto :exec_hermes
 
 :run_hermes_deepseek
@@ -366,7 +388,8 @@ goto :exec_hermes
 
 :exec_hermes
 echo.
-echo %C_GREEN%[*] Launching Hermes Agent (%HERMES_ARGS%) in %CD%...%C_RESET%
+if "!HERMES_ARGS!"=="" echo %C_GREEN%[*] Launching Hermes Agent [Synced Split: !Q_PRIMARY! + !Q_FAST!] in !CD!...%C_RESET%
+if not "!HERMES_ARGS!"=="" echo %C_GREEN%[*] Launching Hermes Agent [!HERMES_ARGS!] in !CD!...%C_RESET%
 
 :: Priority 1: WSL Kali Linux (where the full 63-plugin Nous Research Hermes lives)
 wsl.exe -d kali-linux -u Ade test -f /home/Ade/.local/bin/hermes >nul 2>nul
@@ -433,6 +456,22 @@ goto :menu
 echo.
 node "%QBRANCH_SCRIPT%" config
 %SystemRoot%\system32\pause.exe
+goto :menu
+
+:run_hermes_modes
+echo.
+if exist "%TEMP%\qbranch_hermes_launch.txt" del /q "%TEMP%\qbranch_hermes_launch.txt" >nul 2>nul
+node "%QBRANCH_SCRIPT%" hermes-modes
+if not exist "%TEMP%\qbranch_hermes_launch.txt" goto :menu
+set "HERMES_ARGS="
+set /p HERMES_ARGS=<"%TEMP%\qbranch_hermes_launch.txt"
+del /q "%TEMP%\qbranch_hermes_launch.txt" >nul 2>nul
+if "!HERMES_ARGS!"=="" goto :menu
+goto :exec_hermes
+
+:run_jev
+echo.
+node "%QBRANCH_SCRIPT%" jev
 goto :menu
 
 :session_ended
