@@ -31,6 +31,8 @@ if /i "%~1"=="hermes-deepseek" set "IS_CMD_ARG=1"
 if /i "%~1"=="hermes-yolo" set "IS_CMD_ARG=1"
 if /i "%~1"=="hermes-modes" set "IS_CMD_ARG=1"
 if /i "%~1"=="jev" set "IS_CMD_ARG=1"
+if /i "%~1"=="local-audit" set "IS_CMD_ARG=1"
+if /i "%~1"=="scan" set "IS_CMD_ARG=1"
 if /i "%~1"=="setup" set "IS_CMD_ARG=1"
 if /i "%~1"=="install" set "IS_CMD_ARG=1"
 if /i "%~1"=="usb" set "IS_CMD_ARG=1"
@@ -161,6 +163,8 @@ if /i "%~1"=="hermes-deepseek" goto :run_hermes_deepseek
 if /i "%~1"=="hermes-yolo" goto :run_hermes_yolo
 if /i "%~1"=="hermes-modes" goto :run_hermes_modes
 if /i "%~1"=="jev" goto :run_jev
+if /i "%~1"=="local-audit" goto :run_local_audit
+if /i "%~1"=="scan" goto :run_local_audit
 if /i "%~1"=="setup" goto :run_setup
 if /i "%~1"=="install" goto :run_setup
 if /i "%~1"=="usb" goto :run_usb
@@ -213,11 +217,12 @@ echo   %C_MAGENTA%[K]%C_RESET% %C_WHITE%Skills Arsenal%C_RESET%            %C_GR
 echo   %C_MAGENTA%[M]%C_RESET% %C_WHITE%Online Model Browser%C_RESET%       %C_GRAY%- Browse live gateway models, check Free tier ^& switch%C_RESET%
 echo   %C_MAGENTA%[H]%C_RESET% %C_WHITE%Hermes Modes ^& Split%C_RESET%      %C_GRAY%- Subagent model, reasoning, resume, worktree ^& TUI%C_RESET%
 echo   %C_MAGENTA%[J]%C_RESET% %C_WHITE%Jev Intervention ^& Gate%C_RESET%   %C_GRAY%- Status, live test ^& PreToolUse safety gate%C_RESET%
+echo   %C_CYAN%[L]%C_RESET% %C_WHITE%Local Server Security Audit%C_RESET%%C_GRAY%- Discover PC servers, LAN exposure ^& header posture%C_RESET%
 echo   %C_MAGENTA%[S]%C_RESET% %C_WHITE%Gateway Settings%C_RESET%           %C_GRAY%- View/Update API Key and Gateway URL%C_RESET%
 echo.
 echo   %C_RED%[Q]%C_RESET% %C_WHITE%Q-Branch Signoff%C_RESET%           %C_GRAY%- Return to Base (Exit)%C_RESET%
 echo %C_CYAN%==============================================================================%C_RESET%
-set /p choice="%C_BOLD%Select an operation [1-6, W, I, U, P, K, M, H, J, S, Q] (Default is 1): %C_RESET%"
+set /p choice="%C_BOLD%Select an operation [1-6, W, I, U, P, K, M, H, J, L, S, Q] (Default is 1): %C_RESET%"
 
 if "%choice%"=="" set choice=1
 if /i "%choice%"=="q" goto :exit_007
@@ -235,6 +240,7 @@ if /i "%choice%"=="k" goto :run_skills
 if /i "%choice%"=="m" goto :run_models
 if /i "%choice%"=="h" goto :run_hermes_modes
 if /i "%choice%"=="j" goto :run_jev
+if /i "%choice%"=="l" goto :run_local_audit
 if /i "%choice%"=="s" goto :run_settings
 
 echo %C_RED%Invalid option, please choose from the mission menu.%C_RESET%
@@ -472,6 +478,11 @@ goto :exec_hermes
 :run_jev
 echo.
 node "%QBRANCH_SCRIPT%" jev
+goto :menu
+
+:run_local_audit
+echo.
+node "%QBRANCH_SCRIPT%" local-audit
 goto :menu
 
 :session_ended

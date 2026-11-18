@@ -2373,6 +2373,400 @@ async function manageHermesModes() {
   }
 }
 
+const SYSTEM_PROCESS_NAMES = new Set([
+  'system', 'idle', 'svchost.exe', 'lsass.exe', 'wininit.exe', 'services.exe',
+  'spoolsv.exe', 'searchindexer.exe', 'msmpeng.exe', 'dashost.exe', 'sihost.exe',
+  'fontdrvhost.exe', 'wmiprvse.exe'
+]);
+const SYSTEM_RPC_PORTS = new Set([135, 445, 5040]);
+
+function normalizeAuditHost(hostname) {
+  return String(hostname || '').trim().replace(/^\[|\]$/g, '').split('%')[0].toLowerCase();
+}
+
+/**
+ * Collect all local loopback and interface IPs owned by this machine.
+ */
+function getLocalMachineIps() {
+  const ips = new Set(['127.0.0.1', '::1', 'localhost', '0.0.0.0', '::']);
+  try {
+    const ifaces = os.networkInterfaces();
+    for (const addrs of Object.values(ifaces)) {
+      if (!Array.isArray(addrs)) continue;
+      for (const iface of addrs) {
+        if (iface?.address) {
+          ips.add(normalizeAuditHost(iface.address));
+        }
+      }
+    }
+  } catch (e) {}
+  return ips;
+}
+
+function isStrictlyLocalHost(hostname) {
+  const clean = normalizeAuditHost(hostname);
+  if (!clean) return false;
+  return getLocalMachineIps().has(clean);
+}
+
+/**
+ * Discover active TCP LISTENING sockets and map each port to process name, PID, and exposure scope.
+ */
+function discoverListeningPorts({ includeSystem = false } = {}) {
+  const netstatOut = execSync('netstat -ano', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  const tasklistOut = execSync('tasklist /FO CSV /NH', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+
+  const pidNames = {};
+  for (const line of tasklistOut.split(/\r?\n/)) {
+    const m = line.match(/^"([^"]+)","(\d+)"/);
+    if (m) pidNames[m[2]] = m[1];
+  }
+
+  const byPort = new Map();
+  for (const line of netstatOut.split(/\r?\n/)) {
+    const m = line.match(/^\s*TCP\s+(\S+)\s+\S+\s+LISTENING\s+(\d+)/i);
+    if (!m) continue;
+    const localAddr = m[1];
+    const pid = m[2];
+    const lastColon = localAddr.lastIndexOf(':');
+    if (lastColon <= 0) continue;
+    const bindRaw = localAddr.slice(0, lastColon);
+    const port = Number(localAddr.slice(lastColon + 1));
+    if (!Number.isInteger(port) || port <= 0) continue;
+
+    const procName = pidNames[pid] || `pid:${pid}`;
+    let entry = byPort.get(port);
+    if (!entry) {
+      entry = { port, pids: new Set(), processes: new Set(), bindings: new Set(), hasUserProc: false };
+      byPort.set(port, entry);
+    }
+    entry.pids.add(pid);
+    entry.processes.add(procName);
+    entry.bindings.add(bindRaw);
+    if (!SYSTEM_PROCESS_NAMES.has(procName.toLowerCase()) && !SYSTEM_RPC_PORTS.has(port)) {
+      entry.hasUserProc = true;
+    }
+  }
+
+  const results = [];
+  for (const entry of byPort.values()) {
+    if (!includeSystem && !entry.hasUserProc) continue;
+    const bindings = [...entry.bindings];
+    const isLanExposed = bindings.some(b => {
+      const nb = normalizeAuditHost(b);
+      return nb !== '127.0.0.1' && nb !== '::1';
+    });
+    results.push({
+      port: entry.port,
+      pids: [...entry.pids],
+      processes: [...entry.processes],
+      bindings,
+      exposure: isLanExposed ? 'LAN-EXPOSED' : 'LOOPBACK-ONLY'
+    });
+  }
+  return results.sort((a, b) => a.port - b.port);
+}
+
+/**
+ * Execute a passive non-destructive HTTP request (GET or OPTIONS) to a local URL.
+ */
+async function fetchLocalHttp(urlStr, method = 'GET', timeoutMs = 1200) {
+  const t0 = Date.now();
+  const res = await fetch(urlStr, {
+    method,
+    headers: {
+      Origin: 'https://external-observer.example',
+      'User-Agent': 'QBranch-Local-Audit/1.0'
+    },
+    redirect: 'manual',
+    signal: AbortSignal.timeout(timeoutMs)
+  });
+  const elapsedMs = Date.now() - t0;
+  const headers = {};
+  res.headers.forEach((v, k) => {
+    headers[k.toLowerCase()] = v;
+  });
+  const bodyText = (await res.text()).slice(0, 8192);
+  const titleMatch = bodyText.match(/<title[^>]*>([\s\S]{1,120}?)<\/title>/i);
+  const title = titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim() : '';
+  return { status: res.status, statusText: res.statusText || '', elapsedMs, headers, bodyText, title };
+}
+
+async function probeHttpQuick(entry, timeoutMs = 1200) {
+  const candidates = entry.bindings.every(b => normalizeAuditHost(b) === '::1')
+    ? [`http://[::1]:${entry.port}/`, `http://127.0.0.1:${entry.port}/`]
+    : [`http://127.0.0.1:${entry.port}/`, `http://[::1]:${entry.port}/`];
+  for (const url of candidates) {
+    try {
+      const r = await fetchLocalHttp(url, 'GET', timeoutMs);
+      const acao = r.headers['access-control-allow-origin'] || '';
+      const server = r.headers['server'] || '';
+      const poweredBy = r.headers['x-powered-by'] || '';
+      return {
+        isHttp: true,
+        status: r.status,
+        title: r.title,
+        server,
+        poweredBy,
+        acao,
+        corsOpen: acao === '*' || acao === 'https://external-observer.example'
+      };
+    } catch (e) {}
+  }
+  return { isHttp: false };
+}
+
+function normalizeLocalAuditTarget(rawInput) {
+  const trimmed = String(rawInput || '').trim();
+  if (!trimmed) return { ok: false, error: 'Empty target.' };
+  const candidate = /^\d+$/.test(trimmed)
+    ? `http://127.0.0.1:${trimmed}/`
+    : (/^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`);
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch (e) {
+    return { ok: false, error: `Invalid URL format: "${trimmed}"` };
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    return { ok: false, error: `Unsupported protocol "${parsed.protocol}". Only http/https are supported.` };
+  }
+  if (!isStrictlyLocalHost(parsed.hostname)) {
+    return {
+      ok: false,
+      error: `SAFETY REFUSAL: "${parsed.hostname}" is not a local address on this machine. Local Server Security Audit only inspects localhost, 127.0.0.1, [::1], 0.0.0.0, or local NIC IPs.`
+    };
+  }
+  return { ok: true, url: parsed };
+}
+
+/**
+ * Inspect one strictly-local endpoint passively and print a 4-part defensive security audit.
+ */
+async function inspectLocalEndpoint(rawInput, discoveredList = []) {
+  const norm = normalizeLocalAuditTarget(rawInput);
+  if (!norm.ok) {
+    console.log(`\n${C.red}✗ ${norm.error}${C.reset}`);
+    return;
+  }
+
+  const parsed = norm.url;
+  const port = Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
+  const sock = discoveredList.find(d => d.port === port) || discoverListeningPorts({ includeSystem: true }).find(d => d.port === port);
+
+  const fetchUrl = new URL(parsed.toString());
+  const hNorm = normalizeAuditHost(fetchUrl.hostname);
+  if (hNorm === '0.0.0.0' || hNorm === '::') {
+    fetchUrl.hostname = '127.0.0.1';
+  }
+
+  let getRes = null;
+  let getErr = null;
+  let optRes = null;
+  try {
+    getRes = await fetchLocalHttp(fetchUrl.toString(), 'GET', 2000);
+  } catch (e) {
+    getErr = e.message || String(e);
+  }
+  if (getRes) {
+    try {
+      optRes = await fetchLocalHttp(fetchUrl.toString(), 'OPTIONS', 1500);
+    } catch (e) {}
+  }
+
+  console.log(`\n${C.cyan}╔════════════════════════════════════════════════════════════════════════════╗${C.reset}`);
+  console.log(`${C.cyan}║${C.reset}  ${C.gold}LOCAL ENDPOINT AUDIT : ${parsed.toString().slice(0, 50).padEnd(50)}${C.reset} ${C.cyan}║${C.reset}`);
+  console.log(`${C.cyan}╚════════════════════════════════════════════════════════════════════════════╝${C.reset}`);
+
+  // 1. Socket & Network Binding Exposure
+  console.log(`\n  ${C.bold}[1] SOCKET & NETWORK BINDING EXPOSURE${C.reset}`);
+  if (sock) {
+    const scopeColor = sock.exposure === 'LAN-EXPOSED' ? C.gold : C.green;
+    const lanNote = sock.exposure === 'LAN-EXPOSED'
+      ? 'Reachable by other devices on your Wi-Fi / LAN (subject to Windows Firewall)'
+      : 'Loopback only (local apps & browser tabs on this PC only)';
+    console.log(`    Process / PID    : ${C.white}${sock.processes.join(', ')}${C.reset} (PID ${sock.pids.join(', ')})`);
+    console.log(`    Bound Interfaces : ${C.cyan}${sock.bindings.map(b => `${b}:${port}`).join(', ')}${C.reset}`);
+    console.log(`    Exposure Scope   : ${scopeColor}${sock.exposure}${C.reset} — ${C.gray}${lanNote}${C.reset}`);
+  } else {
+    console.log(`    Socket Status    : ${C.gray}Port ${port} not currently listed in TCP LISTENING sockets${C.reset}`);
+  }
+
+  // 2. Observer Fingerprint
+  console.log(`\n  ${C.bold}[2] OBSERVER FINGERPRINT (WHAT AN EXTERNAL BROWSER / OBSERVER SEES)${C.reset}`);
+  if (!getRes) {
+    console.log(`    HTTP Probe       : ${C.red}No HTTP response (${getErr || 'non-HTTP TCP socket or TLS mismatch'})${C.reset}`);
+    return;
+  }
+
+  const h = getRes.headers;
+  console.log(`    HTTP Status      : ${C.green}${getRes.status} ${getRes.statusText}${C.reset} (${getRes.elapsedMs}ms)`);
+  console.log(`    Server Banner    : ${h['server'] ? C.gold + h['server'] + C.reset : C.gray + '(not disclosed)' + C.reset}`);
+  if (h['x-powered-by']) console.log(`    X-Powered-By     : ${C.gold}${h['x-powered-by']}${C.reset}`);
+  console.log(`    Content-Type     : ${C.white}${h['content-type'] || '(none)'}${C.reset}`);
+  if (getRes.title) console.log(`    Page <title>     : ${C.cyan}${getRes.title}${C.reset}`);
+  if (h['location']) console.log(`    Redirect         : ${C.gray}${h['location']}${C.reset}`);
+  if (optRes) {
+    console.log(`    OPTIONS Probe    : ${C.white}HTTP ${optRes.status}${C.reset}${optRes.headers['allow'] ? ` | Allow: ${optRes.headers['allow']}` : ''}`);
+  }
+
+  // 3. Security Posture & Risk Findings
+  console.log(`\n  ${C.bold}[3] SECURITY POSTURE & RISK FINDINGS${C.reset}`);
+  const findings = [];
+  const fixes = [];
+
+  if (sock && sock.exposure === 'LAN-EXPOSED') {
+    findings.push(`${C.gold}MEDIUM${C.reset}  Wildcard/LAN bind (${sock.bindings.join(', ')}): devices on the same network can reach port ${port}.`);
+    fixes.push('Bind dev servers strictly to 127.0.0.1 unless LAN testing is needed (e.g. Node `.listen(port, "127.0.0.1")`, Vite without `--host`, Uvicorn `--host 127.0.0.1`).');
+  } else if (sock) {
+    findings.push(`${C.green}PASS${C.reset}    Bound to loopback only (${sock.bindings.join(', ')}) — shielded from Wi-Fi/LAN neighbors.`);
+  }
+
+  const acaoGet = h['access-control-allow-origin'] || '';
+  const acaoOpt = optRes?.headers['access-control-allow-origin'] || '';
+  const acao = acaoGet || acaoOpt;
+  const acac = (h['access-control-allow-credentials'] || optRes?.headers['access-control-allow-credentials'] || '').toLowerCase() === 'true';
+  if (acao === '*' || acao === 'https://external-observer.example') {
+    const level = acao === 'https://external-observer.example' && acac ? `${C.red}HIGH${C.reset}   ` : `${C.gold}MEDIUM${C.reset} `;
+    findings.push(`${level} Drive-By Browser CORS (${acao}${acac ? ' + Allow-Credentials: true' : ''}): arbitrary websites open in your browser can read responses from this localhost port.`);
+    fixes.push('Restrict CORS `Access-Control-Allow-Origin` to explicit trusted origins rather than `*` or reflecting arbitrary `Origin` headers.');
+  } else {
+    findings.push(`${C.green}PASS${C.reset}    CORS blocked untrusted test Origin (${acao ? `returned ${acao}` : 'no ACAO header sent'}).`);
+  }
+
+  const bannerHints = [h['server'], h['x-powered-by']].filter(Boolean).join(' / ');
+  if (bannerHints) {
+    findings.push(`${C.gray}INFO${C.reset}    Software fingerprint leaked via headers: ${bannerHints}`);
+    fixes.push('Disable framework banners (`app.disable("x-powered-by")` in Express, `server_tokens off` in Nginx) to minimize version fingerprinting.');
+  }
+
+  const body = getRes.bodyText || '';
+  if (/Index of \/|Directory listing for/i.test(body)) {
+    findings.push(`${C.gold}MEDIUM${C.reset}  Open directory index detected in response body — file tree is browsable.`);
+    fixes.push('Disable automatic directory indexing in production or serve only an explicit static asset directory.');
+  }
+  if (/Werkzeug Debugger|Traceback \(most recent call last\)|at Function\.|ReferenceError:|SyntaxError:/i.test(body)) {
+    findings.push(`${C.red}HIGH${C.reset}    Debug trace or interactive debugger signature spotted in response body.`);
+    fixes.push('Disable interactive debuggers (`DEBUG=False` / disable Werkzeug pinless console) before exposing or leaving services running.');
+  }
+
+  const secHeaders = [
+    ['content-security-policy', 'Content-Security-Policy'],
+    ['x-content-type-options', 'X-Content-Type-Options'],
+    ['x-frame-options', 'X-Frame-Options'],
+    ['cross-origin-resource-policy', 'Cross-Origin-Resource-Policy'],
+    ['referrer-policy', 'Referrer-Policy']
+  ];
+  const missingHeaders = [];
+  console.log(`\n    ${C.gray}Defensive HTTP Headers:${C.reset}`);
+  for (const [key, label] of secHeaders) {
+    const val = h[key];
+    if (val) {
+      console.log(`      ${C.green}✓${C.reset} ${label.padEnd(28)} : ${C.white}${val.slice(0, 60)}${C.reset}`);
+    } else {
+      console.log(`      ${C.gray}-${C.reset} ${label.padEnd(28)} : ${C.gray}missing${C.reset}`);
+      missingHeaders.push(label);
+    }
+  }
+  if (missingHeaders.length > 0) {
+    fixes.push(`Add defensive response headers (${missingHeaders.slice(0, 3).join(', ')} — e.g. \`X-Content-Type-Options: nosniff\`, \`Cross-Origin-Resource-Policy: same-origin\`, \`X-Frame-Options: DENY\`).`);
+  }
+
+  console.log(`\n    ${C.gray}Summary Findings:${C.reset}`);
+  for (const f of findings) console.log(`      ${f}`);
+
+  // 4. Defensive Remediations
+  console.log(`\n  ${C.bold}[4] HOW TO LOCK IT DOWN (DEFENSIVE REMEDIATIONS)${C.reset}`);
+  if (fixes.length === 0) {
+    console.log(`    ${C.green}✓ No common exposure issues detected on this passive check.${C.reset}`);
+  } else {
+    fixes.forEach((fix, idx) => console.log(`    ${C.cyan}${idx + 1}.${C.reset} ${fix}`));
+  }
+}
+
+/**
+ * Interactive local server discovery and passive security posture auditor (`qbranch.mjs local-audit`).
+ */
+async function manageLocalAudit() {
+  let includeSystem = false;
+  while (true) {
+    console.clear();
+    console.log(`${C.cyan}╔════════════════════════════════════════════════════════════════════════════╗${C.reset}`);
+    console.log(`${C.cyan}║${C.reset}  ${C.gold}007 Q-BRANCH : LOCAL SERVER SECURITY & EXPOSURE AUDITOR${C.reset}                  ${C.cyan}║${C.reset}`);
+    console.log(`${C.cyan}╚════════════════════════════════════════════════════════════════════════════╝${C.reset}`);
+    console.log(`  ${C.gray}Safety Guardrail   :${C.reset} ${C.green}STRICTLY LOCAL-ONLY${C.reset} ${C.gray}(Passive GET/OPTIONS on loopback & local NICs)${C.reset}`);
+    console.log(`  ${C.gray}System/RPC Filter  :${C.reset} ${includeSystem ? C.gold + 'SHOWING ALL WINDOWS PORTS' : C.cyan + 'APP SERVERS ONLY (Use [A] to toggle system ports)'}${C.reset}`);
+    console.log(`${C.cyan}────────────────────────────────────────────────────────────────────────────${C.reset}`);
+
+    let ports = [];
+    try {
+      ports = discoverListeningPorts({ includeSystem });
+    } catch (e) {
+      console.log(`  ${C.red}✗ Could not enumerate local sockets: ${e.message}${C.reset}\n`);
+    }
+
+    const probed = await Promise.all(ports.map(p => probeHttpQuick(p)));
+
+    if (ports.length === 0) {
+      console.log(`  ${C.gray}No active local application servers detected right now.${C.reset}`);
+      console.log(`  ${C.gray}Tip: Start a dev server or enter a custom local URL/port with [U].${C.reset}`);
+    } else {
+      for (let i = 0; i < ports.length; i++) {
+        const s = ports[i];
+        const p = probed[i];
+        const idxTag = `[${i + 1}]`.padEnd(5);
+        const portCol = `:${s.port}`.padEnd(7);
+        const procCol = s.processes.join(',').slice(0, 18).padEnd(18);
+        const scopeTag = s.exposure === 'LAN-EXPOSED'
+          ? `${C.gold}LAN-EXPOSED  ${C.reset}`
+          : `${C.green}LOOPBACK-ONLY${C.reset}`;
+        let httpTag = `${C.gray}[non-HTTP TCP]${C.reset}`;
+        if (p.isHttp) {
+          const flags = [];
+          if (p.corsOpen) flags.push('CORS-OPEN');
+          if (p.server || p.poweredBy) flags.push(p.server || p.poweredBy);
+          const titlePart = p.title ? ` "${p.title.slice(0, 22)}"` : '';
+          httpTag = `${C.cyan}HTTP ${p.status}${C.reset}${flags.length ? ` ${C.gold}[${flags.join(' | ')}]${C.reset}` : ''}${C.gray}${titlePart}${C.reset}`;
+        }
+        console.log(`  ${C.green}${idxTag}${C.reset} ${C.white}${portCol}${C.reset} ${procCol} ${scopeTag}  ${httpTag}`);
+      }
+    }
+
+    console.log(`${C.cyan}────────────────────────────────────────────────────────────────────────────${C.reset}`);
+    console.log(`  ${C.green}[1..N]${C.reset} Deep-inspect server   ${C.cyan}[U]${C.reset} Inspect local URL/port   ${C.magenta}[A]${C.reset} Toggle system ports`);
+    console.log(`  ${C.cyan}[R]${C.reset}    Rescan ports          ${C.red}[0]${C.reset} Return to Main Menu\n`);
+
+    const portPrompt = ports.length > 0 ? `1-${ports.length}, ` : '';
+    const choice = (await ask(`Select option [${portPrompt}U, A, R, 0]: `)).trim().toLowerCase();
+    if (!choice || choice === '0' || choice === 'q' || choice === 'b') break;
+
+    if (choice === 'a') {
+      includeSystem = !includeSystem;
+    } else if (choice === 'r') {
+      continue;
+    } else if (choice === 'u') {
+      const target = await ask(`Enter local URL or port (e.g. 3000, localhost:5173, http://127.0.0.1:8080/api): `);
+      if (target) {
+        await inspectLocalEndpoint(target, ports);
+        console.log();
+        await ask(`Press Enter to continue... `);
+      }
+    } else {
+      const num = parseInt(choice, 10);
+      if (Number.isInteger(num) && num >= 1 && num <= ports.length) {
+        const picked = ports[num - 1];
+        const host = picked.bindings.every(b => normalizeAuditHost(b) === '::1') ? '[::1]' : '127.0.0.1';
+        await inspectLocalEndpoint(`http://${host}:${picked.port}/`, ports);
+        console.log();
+        await ask(`Press Enter to continue... `);
+      } else {
+        console.log(`${C.red}Invalid selection.${C.reset}`);
+        await ask(`Press Enter to continue... `);
+      }
+    }
+  }
+}
+
 function printEnvSummary() {
   const settings = readClaudeSettings();
   const env = settings.env || {};
@@ -2451,6 +2845,8 @@ try {
     await manageJev();
   } else if (cmd === 'hermes-modes' || cmd === 'hermes') {
     await manageHermesModes();
+  } else if (cmd === 'local-audit' || cmd === 'scan' || cmd === 'audit') {
+    await manageLocalAudit();
   } else if (cmd === 'skills') {
     await manageSkills(currentDir);
   } else if (cmd === 'profiles' || cmd === 'loadouts') {
