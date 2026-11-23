@@ -81,6 +81,8 @@ function runWsl(bashCmd, options = {}) {
   }
 }
 
+const IS_WIN = process.platform === 'win32';
+const IS_MAC = process.platform === 'darwin';
 const IS_PORTABLE_MODE = Boolean(
   process.env.CLAUDE_CONFIG_DIR || process.env.HERMES_HOME || process.env.QBRANCH_PORTABLE === '1'
 );
@@ -89,6 +91,26 @@ const CLAUDE_ACTIVE_SETTINGS_PATH = process.env.CLAUDE_CONFIG_DIR
   : CLAUDE_SETTINGS_PATH;
 const JEV_GATE_ALLOW_RULES = ['mcp__jev__jev_judge', 'mcp__jev__jev_gate'];
 const WSL_HERMES_CONFIG_UNC = '\\\\wsl.localhost\\kali-linux\\home\\Ade\\.hermes\\config.yaml';
+
+function isDirWritable(dirPath) {
+  if (!dirPath) return false;
+  try {
+    if (!fs.existsSync(dirPath)) return false;
+    fs.accessSync(dirPath, fs.constants.W_OK);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function getActiveHermesConfigDir() {
+  if (process.env.HERMES_HOME) return process.env.HERMES_HOME;
+  if (IS_PORTABLE_MODE && process.env.USB_ROOT) {
+    return path.join(process.env.USB_ROOT, 'config', 'hermes');
+  }
+  if (!IS_WIN) return path.join(USER_HOME, '.hermes');
+  return null;
+}
 
 function readClaudeSettings() {
   for (const p of [CLAUDE_ACTIVE_SETTINGS_PATH, CLAUDE_SETTINGS_PATH]) {
@@ -103,7 +125,9 @@ function readClaudeSettings() {
 
 function saveClaudeSettings(settings) {
   const payload = JSON.stringify(settings, null, 2);
-  const targets = new Set([CLAUDE_SETTINGS_PATH, CLAUDE_ACTIVE_SETTINGS_PATH]);
+  const targets = process.env.QBRANCH_MAC_HOME
+    ? new Set([CLAUDE_ACTIVE_SETTINGS_PATH])
+    : new Set([CLAUDE_SETTINGS_PATH, CLAUDE_ACTIVE_SETTINGS_PATH]);
   for (const p of targets) {
     fs.mkdirSync(path.dirname(p), { recursive: true });
     fs.writeFileSync(p, payload, 'utf8');
@@ -156,6 +180,7 @@ function findCachedNpxJevDir() {
 
 function getLocalJevBundleDir() {
   const candidates = [
+    process.env.QBRANCH_MAC_HOME ? path.join(process.env.QBRANCH_MAC_HOME, 'runtime', 'jev-use') : null,
     process.env.USB_ROOT ? path.join(process.env.USB_ROOT, 'runtime', 'jev-use') : null,
     path.join(SCRIPT_DIR, 'runtime', 'jev-use'),
     path.join(USER_HOME, '.claude', 'jev-use'),
@@ -319,16 +344,28 @@ function syncToHermes(primaryModel, baseUrl, apiKey, fastModel = null) {
       : null;
     const typesafeBase = baseUrl ? baseUrl.replace(/\/v1\/?$/, '').replace(/\/+$/, '') : null;
 
-    if (process.env.USB_ROOT) {
-      const usbCfgPath = path.join(process.env.USB_ROOT, 'config', 'hermes', 'config.yaml');
-      const usbEnvPath = path.join(process.env.USB_ROOT, 'config', 'hermes', '.env');
-      writePortableHermesFiles(
-        path.join(process.env.USB_ROOT, 'config', 'hermes'),
-        { primaryModel, fastModel, baseUrl: hermesUrl, apiKey, typesafeBase }
-      );
-      if (fs.existsSync(usbCfgPath) || fs.existsSync(usbEnvPath)) {
-        // Also keep WSL in sync if present
+    if (process.env.HERMES_HOME) {
+      writePortableHermesFiles(process.env.HERMES_HOME, {
+        primaryModel, fastModel, baseUrl: hermesUrl, apiKey, typesafeBase
+      });
+    }
+
+    if (process.env.USB_ROOT && isDirWritable(process.env.USB_ROOT)) {
+      const usbHermesDir = path.join(process.env.USB_ROOT, 'config', 'hermes');
+      if (!process.env.HERMES_HOME || path.resolve(usbHermesDir) !== path.resolve(process.env.HERMES_HOME)) {
+        writePortableHermesFiles(usbHermesDir, {
+          primaryModel, fastModel, baseUrl: hermesUrl, apiKey, typesafeBase
+        });
       }
+    }
+
+    if (!IS_WIN) {
+      if (!process.env.HERMES_HOME) {
+        writePortableHermesFiles(path.join(USER_HOME, '.hermes'), {
+          primaryModel, fastModel, baseUrl: hermesUrl, apiKey, typesafeBase
+        });
+      }
+      return true;
     }
 
     const ok = runWslHermesPython({
@@ -374,13 +411,24 @@ function writePortableHermesFiles(hermesConfigDir, opts) {
     if (opts.fastModel === undefined) curFast = raw.match(/delegation:\s*\r?\n\s*model:\s*"([^"]+)"/m)?.[1] || curFast;
     if (!opts.reasoning) curReasoning = raw.match(/reasoning_effort:\s*"([^"]+)"/m)?.[1] || curReasoning;
   }
-  const usbRootGuess = path.resolve(hermesConfigDir, '..', '..');
-  const bundledCli = path.join(usbRootGuess, 'runtime', 'jev-use', 'node_modules', 'jev-use', 'dist', 'cli.js');
-  const bundledNode = path.join(usbRootGuess, 'runtime', 'node', 'node.exe');
-  const jevCmd = fs.existsSync(bundledCli)
-    ? (fs.existsSync(bundledNode) ? bundledNode.replace(/\\/g, '/') : 'node')
+  const rootGuess = path.resolve(hermesConfigDir, '..', '..');
+  const cliCandidates = [
+    path.join(rootGuess, 'runtime', 'jev-use', 'node_modules', 'jev-use', 'dist', 'cli.js'),
+    process.env.QBRANCH_MAC_HOME ? path.join(process.env.QBRANCH_MAC_HOME, 'runtime', 'jev-use', 'node_modules', 'jev-use', 'dist', 'cli.js') : null
+  ].filter(Boolean);
+  const bundledCli = cliCandidates.find(p => fs.existsSync(p)) || '';
+  const nodeCandidates = IS_WIN
+    ? [path.join(rootGuess, 'runtime', 'node', 'node.exe')]
+    : [
+        path.join(rootGuess, 'runtime', 'node', 'bin', 'node'),
+        process.env.QBRANCH_MAC_HOME ? path.join(process.env.QBRANCH_MAC_HOME, 'runtime', 'node', 'bin', 'node') : null,
+        process.execPath
+      ].filter(Boolean);
+  const bundledNode = nodeCandidates.find(p => fs.existsSync(p)) || '';
+  const jevCmd = bundledCli
+    ? (bundledNode ? bundledNode.replace(/\\/g, '/') : 'node')
     : 'npx';
-  const jevArgs = fs.existsSync(bundledCli)
+  const jevArgs = bundledCli
     ? `["${bundledCli.replace(/\\/g, '/')}", "serve"]`
     : '["-y", "jev-use@0.8.0", "serve"]';
   const typesafeBase = opts.typesafeBase || curUrl.replace(/\/v1\/?$/, '').replace(/\/+$/, '');
@@ -527,21 +575,29 @@ async function applyMissionLoadout(profileKey) {
   }
   console.log(`  ${C.green}✓${C.reset} Claude Code updated: ${C.white}${installedClaude} skills active${C.reset}`);
 
-  // 3. Deploy to Hermes Agent (WSL Kali or Portable USB)
-  if (process.env.USB_ROOT) {
+  // 3. Deploy to Hermes Agent (macOS/Portable HERMES_HOME, writable USB, or WSL Kali)
+  const activeHermesDir = getActiveHermesConfigDir();
+  if (activeHermesDir) {
+    const hermesVault = path.join(activeHermesDir, 'skills', 'vault');
+    fs.rmSync(hermesVault, { recursive: true, force: true });
+    safeCopyDir(targetClaudeSkillsDir, hermesVault);
+  }
+  if (process.env.USB_ROOT && isDirWritable(process.env.USB_ROOT)) {
     const usbHermesVault = path.join(process.env.USB_ROOT, 'config', 'hermes', 'skills', 'vault');
-    fs.rmSync(usbHermesVault, { recursive: true, force: true });
-    safeCopyDir(targetClaudeSkillsDir, usbHermesVault);
-  } else {
+    if (!activeHermesDir || path.resolve(usbHermesVault) !== path.resolve(path.join(activeHermesDir, 'skills', 'vault'))) {
+      fs.rmSync(usbHermesVault, { recursive: true, force: true });
+      safeCopyDir(targetClaudeSkillsDir, usbHermesVault);
+    }
+  }
+  if (IS_WIN && !IS_PORTABLE_MODE) {
     console.log(`  [*] Synchronizing to Hermes Agent (WSL Kali ~/.hermes/skills/vault)...`);
     runWsl('mkdir -p /home/Ade/.hermes/skills/vault && rm -rf /home/Ade/.hermes/skills/vault/*');
     runWsl(`cp -r "${toWslPath(targetClaudeSkillsDir)}/." /home/Ade/.hermes/skills/vault/`);
+    // 4. Stow Hermes built-in clutter (apple, productivity)
+    console.log(`  [*] Stowing Hermes built-in office & personal clutter...`);
+    runWsl('mkdir -p /home/Ade/.hermes/skills/.stowed_clutter && for d in apple productivity; do [ -d "/home/Ade/.hermes/skills/$d" ] && mv "/home/Ade/.hermes/skills/$d" "/home/Ade/.hermes/skills/.stowed_clutter/"; done 2>/dev/null || true');
   }
-
-  // 4. Stow Hermes built-in clutter (apple, productivity)
-  console.log(`  [*] Stowing Hermes built-in office & personal clutter...`);
-  runWsl('mkdir -p /home/Ade/.hermes/skills/.stowed_clutter && for d in apple productivity; do [ -d "/home/Ade/.hermes/skills/$d" ] && mv "/home/Ade/.hermes/skills/$d" "/home/Ade/.hermes/skills/.stowed_clutter/"; done 2>/dev/null || true');
-  console.log(`  ${C.green}✓${C.reset} Hermes Agent: ${C.white}${installedClaude} vault combat skills active, clutter stowed!${C.reset}`);
+  console.log(`  ${C.green}✓${C.reset} Hermes Agent: ${C.white}${installedClaude} vault combat skills active!${C.reset}`);
 
   console.log(`\n${C.gold}✨ MISSION LOADOUT DEPLOYED SUCCESSFULLY! ✨${C.reset}\n`);
 }
@@ -1905,7 +1961,7 @@ async function buildUsbDrive(currentDir) {
     }
   }
 
-  // Copy Launch Agent.bat, qbranch.mjs, package.json
+  // Copy Launch Agent.bat, Launch Agent (Mac).command, qbranch.mjs, qbranch-agent.mjs, package.json, START-ON-MAC.txt
   const batSrc = path.join(SCRIPT_DIR, 'Launch Agent.bat');
   if (fs.existsSync(batSrc)) {
     fs.copyFileSync(batSrc, path.join(targetPath, 'Launch Agent.bat'));
@@ -1913,14 +1969,24 @@ async function buildUsbDrive(currentDir) {
     fs.copyFileSync(path.join(USER_HOME, 'Desktop', 'Launch Agent.bat'), path.join(targetPath, 'Launch Agent.bat'));
   }
 
-  const mjsSrc = path.join(SCRIPT_DIR, 'qbranch.mjs');
-  if (fs.existsSync(mjsSrc)) {
-    fs.copyFileSync(mjsSrc, path.join(targetPath, 'qbranch.mjs'));
+  for (const extraFile of ['Launch Agent (Mac).command', 'qbranch.mjs', 'qbranch-agent.mjs', 'package.json', 'START-ON-MAC.txt']) {
+    const src = path.join(SCRIPT_DIR, extraFile);
+    if (fs.existsSync(src)) {
+      fs.copyFileSync(src, path.join(targetPath, extraFile));
+    }
   }
 
-  const pkgSrc = path.join(SCRIPT_DIR, 'package.json');
-  if (fs.existsSync(pkgSrc)) {
-    fs.copyFileSync(pkgSrc, path.join(targetPath, 'package.json'));
+  // Copy macOS Node 20 Catalina-compatible tarball if cached
+  const macNodeSrc = [
+    path.join(SCRIPT_DIR, 'runtime', 'mac', 'node-darwin-x64.tar.gz'),
+    process.env.USB_ROOT ? path.join(process.env.USB_ROOT, 'runtime', 'mac', 'node-darwin-x64.tar.gz') : null
+  ].find(p => p && fs.existsSync(p));
+  if (macNodeSrc) {
+    const macNodeDest = path.join(targetPath, 'runtime', 'mac', 'node-darwin-x64.tar.gz');
+    if (path.resolve(macNodeSrc) !== path.resolve(macNodeDest)) {
+      fs.mkdirSync(path.dirname(macNodeDest), { recursive: true });
+      fs.copyFileSync(macNodeSrc, macNodeDest);
+    }
   }
 
   // Generate README-PORTABLE.md
@@ -1988,11 +2054,16 @@ function syncJevIntegration({ apiKey = null, baseUrl = null, toggleGate = null, 
 
   // 1. Ensure local jev-use bundle so MCP & hooks start in <50ms without npm latency
   const usbRoot = process.env.USB_ROOT;
-  const primaryBundleTarget = (IS_PORTABLE_MODE && usbRoot)
-    ? path.join(usbRoot, 'runtime', 'jev-use')
-    : path.join(USER_HOME, '.claude', 'jev-use');
+  const primaryBundleTarget = process.env.QBRANCH_MAC_HOME
+    ? path.join(process.env.QBRANCH_MAC_HOME, 'runtime', 'jev-use')
+    : ((IS_PORTABLE_MODE && usbRoot && isDirWritable(usbRoot))
+      ? path.join(usbRoot, 'runtime', 'jev-use')
+      : path.join(USER_HOME, '.claude', 'jev-use'));
   ensureLocalJevBundle(primaryBundleTarget, allowNpmInstall);
   const inv = resolveJevInvocation(primaryBundleTarget);
+  if (!IS_WIN && inv.command === 'node') {
+    inv.command = process.execPath;
+  }
 
   // 2. Wire Claude Code settings.env + permissions.allow + optional PreToolUse gate
   if (resolvedKey) settings.env.TYPESAFE_API_KEY = resolvedKey;
@@ -2010,7 +2081,10 @@ function syncJevIntegration({ apiKey = null, baseUrl = null, toggleGate = null, 
   saveClaudeSettings(settings);
 
   // 3. Wire Claude Code ~/.claude.json (+ portable CLAUDE_CONFIG_DIR/.claude.json)
-  for (const cj of getClaudeJsonPaths()) {
+  const cjTargets = process.env.QBRANCH_MAC_HOME && process.env.CLAUDE_CONFIG_DIR
+    ? [path.join(process.env.CLAUDE_CONFIG_DIR, '.claude.json')]
+    : getClaudeJsonPaths();
+  for (const cj of cjTargets) {
     const cfg = readJsonSafe(cj, {});
     const mcp = cfg.mcpServers || {};
     mcp.jev = {
@@ -2026,20 +2100,24 @@ function syncJevIntegration({ apiKey = null, baseUrl = null, toggleGate = null, 
     writeJsonSafe(cj, cfg);
   }
 
-  // 4. Deploy jev-use skill to Claude & WSL Hermes
+  // 4. Deploy jev-use skill to Claude & Hermes
   const jevSkillSrc = resolveSkillPath('jev-use');
+  const activeHermesDir = getActiveHermesConfigDir();
   if (jevSkillSrc && fs.existsSync(jevSkillSrc)) {
     const claudeSkillDir = process.env.CLAUDE_CONFIG_DIR
       ? path.join(process.env.CLAUDE_CONFIG_DIR, 'skills', 'jev-use')
       : path.join(CLAUDE_SKILLS_PATH, 'jev-use');
     safeCopyDir(jevSkillSrc, claudeSkillDir);
-    if (!IS_PORTABLE_MODE && fs.existsSync(WSL_HERMES_CONFIG_UNC)) {
+    if (activeHermesDir && isDirWritable(path.dirname(activeHermesDir))) {
+      safeCopyDir(jevSkillSrc, path.join(activeHermesDir, 'skills', 'vault', 'jev-use'));
+    }
+    if (IS_WIN && !IS_PORTABLE_MODE && fs.existsSync(WSL_HERMES_CONFIG_UNC)) {
       runWsl(`mkdir -p /home/Ade/.hermes/skills/vault/jev-use && cp -r "${toWslPath(jevSkillSrc)}/." /home/Ade/.hermes/skills/vault/jev-use/`);
     }
   }
 
-  // 5. Sync WSL Hermes (install jev-use if absent + write mcp_servers.jev & .env)
-  if (!IS_PORTABLE_MODE && fs.existsSync(WSL_HERMES_CONFIG_UNC)) {
+  // 5. Sync Hermes (WSL on Windows Host, or HERMES_HOME on macOS / Linux)
+  if (IS_WIN && !IS_PORTABLE_MODE && fs.existsSync(WSL_HERMES_CONFIG_UNC)) {
     runWsl('if [ ! -f /home/Ade/.hermes/tools/jev-use/node_modules/jev-use/dist/cli.js ]; then mkdir -p /home/Ade/.hermes/tools/jev-use && npm --prefix /home/Ade/.hermes/tools/jev-use install --no-save jev-use@0.8.0 >/dev/null 2>&1 || true; fi');
     runWslHermesPython({
       env: {
@@ -2048,10 +2126,16 @@ function syncJevIntegration({ apiKey = null, baseUrl = null, toggleGate = null, 
       },
       wireJevMcp: true
     });
+  } else if (activeHermesDir) {
+    writePortableHermesFiles(activeHermesDir, {
+      baseUrl: `${resolvedBase}/v1`,
+      apiKey: resolvedKey,
+      typesafeBase: resolvedBase
+    });
   }
 
-  // 6. Sync / mirror USB Portable suite if USB_ROOT is attached or active
-  if (usbRoot && fs.existsSync(usbRoot)) {
+  // 6. Sync / mirror USB Portable suite if USB_ROOT is attached AND writable (skip read-only NTFS on macOS)
+  if (usbRoot && isDirWritable(usbRoot)) {
     const usbJevBundle = path.join(usbRoot, 'runtime', 'jev-use');
     ensureLocalJevBundle(usbJevBundle, allowNpmInstall);
     const usbCli = path.join(usbJevBundle, 'node_modules', 'jev-use', 'dist', 'cli.js');
@@ -2155,8 +2239,9 @@ function inspectJevState() {
 
   let hermesJev = false;
   try {
-    const cfgPath = IS_PORTABLE_MODE && process.env.USB_ROOT
-      ? path.join(process.env.USB_ROOT, 'config', 'hermes', 'config.yaml')
+    const activeHermesDir = getActiveHermesConfigDir();
+    const cfgPath = activeHermesDir
+      ? path.join(activeHermesDir, 'config.yaml')
       : WSL_HERMES_CONFIG_UNC;
     if (fs.existsSync(cfgPath)) {
       const mcpBlock = extractTopLevelYamlSection(fs.readFileSync(cfgPath, 'utf8'), 'mcp_servers');
@@ -2266,8 +2351,9 @@ async function manageJev() {
 }
 
 function readHermesYamlSummary() {
-  const cfgPath = IS_PORTABLE_MODE && process.env.USB_ROOT
-    ? path.join(process.env.USB_ROOT, 'config', 'hermes', 'config.yaml')
+  const activeHermesDir = getActiveHermesConfigDir();
+  const cfgPath = activeHermesDir
+    ? path.join(activeHermesDir, 'config.yaml')
     : WSL_HERMES_CONFIG_UNC;
   const info = {
     exists: false,
@@ -2335,22 +2421,36 @@ async function manageHermesModes() {
       await ask(`Press Enter to continue... `);
     } else if (c === '2') {
       const sub = (await ask(`Enter delegation.model (e.g. deepseek-v4.1-flash-1017, blank = inherit parent): `)).trim();
-      if (!IS_PORTABLE_MODE && fs.existsSync(WSL_HERMES_CONFIG_UNC)) {
+      if (IS_WIN && !IS_PORTABLE_MODE && fs.existsSync(WSL_HERMES_CONFIG_UNC)) {
         runWslHermesPython({ fastModel: sub });
       }
-      if (process.env.USB_ROOT && fs.existsSync(process.env.USB_ROOT)) {
-        writePortableHermesFiles(path.join(process.env.USB_ROOT, 'config', 'hermes'), { fastModel: sub });
+      const activeHermesDir = getActiveHermesConfigDir();
+      if (activeHermesDir) {
+        writePortableHermesFiles(activeHermesDir, { fastModel: sub });
+      }
+      if (process.env.USB_ROOT && isDirWritable(process.env.USB_ROOT)) {
+        const usbHermes = path.join(process.env.USB_ROOT, 'config', 'hermes');
+        if (!activeHermesDir || path.resolve(usbHermes) !== path.resolve(activeHermesDir)) {
+          writePortableHermesFiles(usbHermes, { fastModel: sub });
+        }
       }
       console.log(`${C.green}✓ Hermes delegation.model updated!${C.reset}`);
       await ask(`Press Enter to continue... `);
     } else if (c === '3') {
       const lvl = (await ask(`Enter reasoning effort [none|minimal|low|medium|high|xhigh]: `)).trim().toLowerCase();
       if (['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(lvl)) {
-        if (!IS_PORTABLE_MODE && fs.existsSync(WSL_HERMES_CONFIG_UNC)) {
+        if (IS_WIN && !IS_PORTABLE_MODE && fs.existsSync(WSL_HERMES_CONFIG_UNC)) {
           runWslHermesPython({ reasoning: lvl });
         }
-        if (process.env.USB_ROOT && fs.existsSync(process.env.USB_ROOT)) {
-          writePortableHermesFiles(path.join(process.env.USB_ROOT, 'config', 'hermes'), { reasoning: lvl });
+        const activeHermesDir = getActiveHermesConfigDir();
+        if (activeHermesDir) {
+          writePortableHermesFiles(activeHermesDir, { reasoning: lvl });
+        }
+        if (process.env.USB_ROOT && isDirWritable(process.env.USB_ROOT)) {
+          const usbHermes = path.join(process.env.USB_ROOT, 'config', 'hermes');
+          if (!activeHermesDir || path.resolve(usbHermes) !== path.resolve(activeHermesDir)) {
+            writePortableHermesFiles(usbHermes, { reasoning: lvl });
+          }
         }
         console.log(`${C.green}✓ Reasoning effort set to "${lvl}".${C.reset}`);
       } else {
@@ -2376,7 +2476,9 @@ async function manageHermesModes() {
 const SYSTEM_PROCESS_NAMES = new Set([
   'system', 'idle', 'svchost.exe', 'lsass.exe', 'wininit.exe', 'services.exe',
   'spoolsv.exe', 'searchindexer.exe', 'msmpeng.exe', 'dashost.exe', 'sihost.exe',
-  'fontdrvhost.exe', 'wmiprvse.exe'
+  'fontdrvhost.exe', 'wmiprvse.exe',
+  'rapportd', 'controlcenter', 'airplayxpchelper', 'mdnsresponder', 'launchd',
+  'sharingd', 'identityservicesd'
 ]);
 const SYSTEM_RPC_PORTS = new Set([135, 445, 5040]);
 
@@ -2411,40 +2513,60 @@ function isStrictlyLocalHost(hostname) {
 
 /**
  * Discover active TCP LISTENING sockets and map each port to process name, PID, and exposure scope.
+ * Uses netstat+tasklist on Windows and native lsof on macOS/Linux.
  */
 function discoverListeningPorts({ includeSystem = false } = {}) {
-  const netstatOut = execSync('netstat -ano', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-  const tasklistOut = execSync('tasklist /FO CSV /NH', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-
-  const pidNames = {};
-  for (const line of tasklistOut.split(/\r?\n/)) {
-    const m = line.match(/^"([^"]+)","(\d+)"/);
-    if (m) pidNames[m[2]] = m[1];
-  }
-
   const byPort = new Map();
-  for (const line of netstatOut.split(/\r?\n/)) {
-    const m = line.match(/^\s*TCP\s+(\S+)\s+\S+\s+LISTENING\s+(\d+)/i);
-    if (!m) continue;
-    const localAddr = m[1];
-    const pid = m[2];
-    const lastColon = localAddr.lastIndexOf(':');
-    if (lastColon <= 0) continue;
-    const bindRaw = localAddr.slice(0, lastColon);
-    const port = Number(localAddr.slice(lastColon + 1));
-    if (!Number.isInteger(port) || port <= 0) continue;
-
-    const procName = pidNames[pid] || `pid:${pid}`;
+  const addEntry = (port, pid, procName, bindRaw) => {
+    if (!Number.isInteger(port) || port <= 0) return;
     let entry = byPort.get(port);
     if (!entry) {
       entry = { port, pids: new Set(), processes: new Set(), bindings: new Set(), hasUserProc: false };
       byPort.set(port, entry);
     }
-    entry.pids.add(pid);
+    entry.pids.add(String(pid));
     entry.processes.add(procName);
     entry.bindings.add(bindRaw);
     if (!SYSTEM_PROCESS_NAMES.has(procName.toLowerCase()) && !SYSTEM_RPC_PORTS.has(port)) {
       entry.hasUserProc = true;
+    }
+  };
+
+  if (IS_WIN) {
+    const netstatOut = execSync('netstat -ano', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const tasklistOut = execSync('tasklist /FO CSV /NH', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+
+    const pidNames = {};
+    for (const line of tasklistOut.split(/\r?\n/)) {
+      const m = line.match(/^"([^"]+)","(\d+)"/);
+      if (m) pidNames[m[2]] = m[1];
+    }
+
+    for (const line of netstatOut.split(/\r?\n/)) {
+      const m = line.match(/^\s*TCP\s+(\S+)\s+\S+\s+LISTENING\s+(\d+)/i);
+      if (!m) continue;
+      const localAddr = m[1];
+      const pid = m[2];
+      const lastColon = localAddr.lastIndexOf(':');
+      if (lastColon <= 0) continue;
+      const bindRaw = localAddr.slice(0, lastColon);
+      const port = Number(localAddr.slice(lastColon + 1));
+      addEntry(port, pid, pidNames[pid] || `pid:${pid}`, bindRaw);
+    }
+  } else {
+    const lsofOut = execSync('lsof -nP -iTCP -sTCP:LISTEN', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    for (const line of lsofOut.split(/\r?\n/).slice(1)) {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 9) continue;
+      const procName = parts[0].replace(/\\x20/g, ' ');
+      const pid = parts[1];
+      const nameToken = parts.find(p => /:\d+$/.test(p));
+      if (!nameToken) continue;
+      const lastColon = nameToken.lastIndexOf(':');
+      let bindRaw = nameToken.slice(0, lastColon);
+      if (bindRaw === '*') bindRaw = '0.0.0.0';
+      const port = Number(nameToken.slice(lastColon + 1));
+      addEntry(port, pid, procName, bindRaw);
     }
   }
 

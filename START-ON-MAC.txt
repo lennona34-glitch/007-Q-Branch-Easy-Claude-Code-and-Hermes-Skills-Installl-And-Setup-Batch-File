@@ -1,0 +1,35 @@
+==============================================================================
+  007 Q-BRANCH : MACBOOK PRO QUICKSTART (macOS 10.15 Catalina & Newer)
+==============================================================================
+
+Because this external drive ("My Stuff") is formatted NTFS, macOS mounts it
+READ-ONLY. That is totally fine — Q-Branch handles it automatically!
+
+FIRST-TIME LAUNCH ON YOUR MACBOOK PRO:
+1. Plug the USB drive into your MacBook Pro.
+2. Try double-clicking "Launch Agent (Mac).command" in Finder.
+   - If macOS says "access privileges" (normal on read-only NTFS drives),
+     open Terminal (Cmd + Space -> type Terminal -> Enter) and paste:
+
+     bash "/Volumes/My Stuff/Q-Branch-Portable/Launch Agent (Mac).command"
+
+WHAT HAPPENS AUTOMATICALLY ON FIRST RUN:
+- Extracts the pre-bundled Catalina-compatible Node.js 20 runtime (darwin-x64,
+  minos=10.15.0) straight off the USB drive into ~/Q-Branch-Mac/runtime/node/.
+- Mirrors your API key, active models, Jev MCP engine, and all 45+ Q-Branch
+  skills into ~/Q-Branch-Mac/ (fast local SSD storage — leaves NTFS untouched).
+- Creates a clickable shortcut right on your Mac Desktop:
+    ~/Desktop/Q-Branch Agent.command
+  From run #2 onward, just double-click "Q-Branch Agent.command" on your
+  Mac Desktop (works with the USB plugged in OR unplugged!).
+
+WHICH AGENT TO PICK ON MACOS 10.15 CATALINA:
+- [3] Q-Branch Direct Agent  -> Works INSTANTLY on Catalina (zero downloads,
+                                full shell/file/grep/skills/Jev tools).
+- [1] Hermes Agent           -> Press [I] once to install Python 3.14 Hermes
+                                natively on Intel macOS, synced to your keys.
+- [L] Local Server Audit     -> Scans local Mac servers via native lsof.
+- [6] Claude Code            -> Requires macOS 13+ Ventura (auto-enabled if
+                                you ever upgrade via OpenCore Legacy Patcher
+                                or plug the USB into a newer Mac).
+==============================================================================
