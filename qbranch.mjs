@@ -1969,23 +1969,25 @@ async function buildUsbDrive(currentDir) {
     fs.copyFileSync(path.join(USER_HOME, 'Desktop', 'Launch Agent.bat'), path.join(targetPath, 'Launch Agent.bat'));
   }
 
-  for (const extraFile of ['Launch Agent (Mac).command', 'qbranch.mjs', 'qbranch-agent.mjs', 'package.json', 'START-ON-MAC.txt']) {
+  for (const extraFile of ['Launch Agent (Mac).command', 'qbranch.mjs', 'qbranch-agent.mjs', 'qbranch-legacy.cjs', 'package.json', 'START-ON-MAC.txt']) {
     const src = path.join(SCRIPT_DIR, extraFile);
     if (fs.existsSync(src)) {
       fs.copyFileSync(src, path.join(targetPath, extraFile));
     }
   }
 
-  // Copy macOS Node 20 Catalina-compatible tarball if cached
-  const macNodeSrc = [
-    path.join(SCRIPT_DIR, 'runtime', 'mac', 'node-darwin-x64.tar.gz'),
-    process.env.USB_ROOT ? path.join(process.env.USB_ROOT, 'runtime', 'mac', 'node-darwin-x64.tar.gz') : null
-  ].find(p => p && fs.existsSync(p));
-  if (macNodeSrc) {
-    const macNodeDest = path.join(targetPath, 'runtime', 'mac', 'node-darwin-x64.tar.gz');
-    if (path.resolve(macNodeSrc) !== path.resolve(macNodeDest)) {
-      fs.mkdirSync(path.dirname(macNodeDest), { recursive: true });
-      fs.copyFileSync(macNodeSrc, macNodeDest);
+  // Copy macOS Node tarballs (v20 Catalina+ and v10.24.1 Mountain Lion legacy) if cached
+  for (const macTar of ['node-darwin-x64.tar.gz', 'node-darwin-x64-legacy.tar.gz']) {
+    const macNodeSrc = [
+      path.join(SCRIPT_DIR, 'runtime', 'mac', macTar),
+      process.env.USB_ROOT ? path.join(process.env.USB_ROOT, 'runtime', 'mac', macTar) : null
+    ].find(p => p && fs.existsSync(p));
+    if (macNodeSrc) {
+      const macNodeDest = path.join(targetPath, 'runtime', 'mac', macTar);
+      if (path.resolve(macNodeSrc) !== path.resolve(macNodeDest)) {
+        fs.mkdirSync(path.dirname(macNodeDest), { recursive: true });
+        fs.copyFileSync(macNodeSrc, macNodeDest);
+      }
     }
   }
 

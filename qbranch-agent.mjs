@@ -404,7 +404,10 @@ async function executeTool(name, rawArgs, cfg) {
         },
         body: JSON.stringify({
           model: 'jev-latest',
-          messages: [{ role: 'user', content: String(args.question || '') }]
+          state: String(args.state || args.question || ''),
+          questions: {
+            judgment: { type: 'noul', instructions: String(args.question || 'Evaluate this statement.') }
+          }
         }),
         signal: AbortSignal.timeout(8000)
       });

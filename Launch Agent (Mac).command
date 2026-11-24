@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 007 Q-BRANCH : SMART MACOS AGENT COMMAND CENTER (Intel & Apple Silicon)
-# Compatible with macOS 10.15 Catalina (Bash 3.2) through macOS 15+ Sequoia
-# Handles Read-Only NTFS USB drives automatically via ~/Q-Branch-Mac mirror.
+# 007 Q-BRANCH : SMART MACOS AGENT COMMAND CENTER (OS X 10.8 Mountain Lion -> macOS 15+)
+# - Automatic 007 Dark Mode in Terminal.app (switches Basic white -> Pro dark)
+# - Auto-selects Node v10.24.1 (minos=10.7.0, OpenSSL 1.1.1 TLS 1.3) + qbranch-legacy.cjs
+#   on OS X 10.7-10.14 (zero chkstk_darwin crashes!)
+# - Auto-selects Node v20.20.2 + full qbranch.mjs + Hermes/Claude on macOS 10.15+
+# - Handles Read-Only NTFS USB drives automatically via ~/Q-Branch-Mac mirror
+# - 100% Bash 3.2 compatible (built-in OS X bash)
 # ==============================================================================
 
 set -u
@@ -21,15 +25,49 @@ C_GRAY=$'\033[90m'
 printf '\033]0;Q-BRANCH AGENT HUB (macOS 007 Edition)\007'
 
 # ------------------------------------------------------------------------------
-# 1. Detect Hardware, macOS Version & USB Volume
+# 0. Apply 007 Dark Mode in macOS Terminal.app (works from OS X 10.8 -> macOS 15+)
+# ------------------------------------------------------------------------------
+apply_dark_mode() {
+  osascript >/dev/null 2>&1 <<'EOF' || true
+tell application "Terminal"
+  try
+    set current settings of front window to settings set "Pro"
+  on error
+    try
+      set background color of front window to {2500, 3500, 5200}
+      set normal text color of front window to {58000, 61000, 64000}
+      set bold text color of front window to {65535, 65535, 65535}
+      set cursor color of front window to {0, 60000, 60000}
+    end try
+  end try
+end tell
+EOF
+  printf '\033[40m\033[37m\033[2J\033[H'
+}
+
+apply_dark_mode
+
+# ------------------------------------------------------------------------------
+# 1. Detect Hardware, OS X / macOS Version & USB Volume
 # ------------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-MAC_VER="$(sw_vers -productVersion 2>/dev/null || echo '10.15.0')"
+MAC_VER="$(sw_vers -productVersion 2>/dev/null || echo '10.8.5')"
 MAC_ARCH="$(uname -m 2>/dev/null || echo 'x86_64')"
 MAC_MAJOR="$(echo "$MAC_VER" | awk -F. '{print $1+0}')"
 MAC_MINOR="$(echo "$MAC_VER" | awk -F. '{print $2+0}')"
 
+IS_LEGACY_MAC=0
+CAN_HERMES=1
 CAN_CLAUDE=0
+RUNTIME_TIER="modern-v20"
+
+if [ "$MAC_MAJOR" -eq 10 ] && [ "$MAC_MINOR" -lt 15 ]; then
+  IS_LEGACY_MAC=1
+  RUNTIME_TIER="legacy-v10"
+fi
+if [ "$MAC_MAJOR" -eq 10 ] && [ "$MAC_MINOR" -lt 12 ]; then
+  CAN_HERMES=0
+fi
 if [ "$MAC_MAJOR" -ge 13 ]; then
   CAN_CLAUDE=1
 fi
@@ -65,7 +103,7 @@ if [ -n "$USB_ROOT" ]; then
   if [ -w "$USB_ROOT" ]; then
     USB_MODE="USB READ/WRITE ($USB_ROOT)"
   else
-    USB_MODE="USB NTFS READ-ONLY -> MIRRORED TO ~/Q-Branch-Mac"
+    USB_MODE="USB NTFS READ-ONLY -> ~/Q-Branch-Mac"
   fi
 fi
 
@@ -80,33 +118,48 @@ mkdir -p "$MAC_HOME/runtime/node" \
          "$MAC_HOME/sessions"
 
 install_node_runtime() {
-  if [ -x "$MAC_HOME/runtime/node/bin/node" ]; then
+  local tier_file="$MAC_HOME/runtime/node/.qbranch_runtime_tier"
+  local cur_tier=""
+  [ -f "$tier_file" ] && cur_tier="$(cat "$tier_file" 2>/dev/null || true)"
+
+  if [ -x "$MAC_HOME/runtime/node/bin/node" ] && [ "$cur_tier" = "$RUNTIME_TIER" ]; then
     if "$MAC_HOME/runtime/node/bin/node" -v >/dev/null 2>&1; then
       return 0
     fi
   fi
 
-  echo "${C_GOLD}[*] Setting up Catalina-compatible Node.js 20 runtime in ~/Q-Branch-Mac/runtime/node...${C_RESET}"
-  NODE_ARCH="x64"
-  if [ "$MAC_ARCH" = "arm64" ]; then
-    NODE_ARCH="arm64"
-  fi
-
-  TAR_SRC=""
-  if [ -n "$USB_ROOT" ] && [ -f "$USB_ROOT/runtime/mac/node-darwin-${NODE_ARCH}.tar.gz" ]; then
-    TAR_SRC="$USB_ROOT/runtime/mac/node-darwin-${NODE_ARCH}.tar.gz"
-    echo "${C_GREEN}  [+] Found pre-bundled Node.js tarball on USB! Extracting to SSD...${C_RESET}"
-  elif [ -n "$USB_ROOT" ] && [ -f "$USB_ROOT/runtime/mac/node-darwin-x64.tar.gz" ]; then
-    TAR_SRC="$USB_ROOT/runtime/mac/node-darwin-x64.tar.gz"
-    echo "${C_GREEN}  [+] Found pre-bundled Intel x64 Node.js tarball on USB! Extracting...${C_RESET}"
-  else
-    TAR_SRC="/tmp/qbranch-node-v20.20.2-darwin-${NODE_ARCH}.tar.gz"
-    NODE_URL="https://nodejs.org/dist/v20.20.2/node-v20.20.2-darwin-${NODE_ARCH}.tar.gz"
-    echo "${C_CYAN}  [*] Downloading Node.js v20.20.2 (${NODE_ARCH}) from nodejs.org...${C_RESET}"
-    curl -fL "$NODE_URL" -o "$TAR_SRC" || {
-      echo "${C_RED}  [!] Failed to download Node.js. Check internet connection or bundle tarball on USB.${C_RESET}"
+  local TAR_SRC=""
+  if [ "$IS_LEGACY_MAC" -eq 1 ]; then
+    echo "${C_GOLD}[*] OS X ${MAC_VER} detected — installing Legacy Mac Node.js v10.24.1 (minos=10.7.0, OpenSSL TLS 1.3)...${C_RESET}"
+    if [ -n "$USB_ROOT" ] && [ -f "$USB_ROOT/runtime/mac/node-darwin-x64-legacy.tar.gz" ]; then
+      TAR_SRC="$USB_ROOT/runtime/mac/node-darwin-x64-legacy.tar.gz"
+      echo "${C_GREEN}  [+] Found pre-bundled Mountain Lion Node v10.24.1 on USB! Extracting to SSD...${C_RESET}"
+    else
+      echo "${C_RED}  [!] node-darwin-x64-legacy.tar.gz not found on USB (OS X ${MAC_VER} curl cannot use TLS 1.3).${C_RESET}"
+      echo "${C_WHITE}  Please copy runtime/mac/node-darwin-x64-legacy.tar.gz from Windows to USB.${C_RESET}"
       return 1
-    }
+    fi
+  else
+    echo "${C_GOLD}[*] Setting up macOS Node.js 20 runtime in ~/Q-Branch-Mac/runtime/node...${C_RESET}"
+    local NODE_ARCH="x64"
+    if [ "$MAC_ARCH" = "arm64" ]; then
+      NODE_ARCH="arm64"
+    fi
+    if [ -n "$USB_ROOT" ] && [ -f "$USB_ROOT/runtime/mac/node-darwin-${NODE_ARCH}.tar.gz" ]; then
+      TAR_SRC="$USB_ROOT/runtime/mac/node-darwin-${NODE_ARCH}.tar.gz"
+      echo "${C_GREEN}  [+] Found pre-bundled Node.js 20 tarball on USB! Extracting to SSD...${C_RESET}"
+    elif [ -n "$USB_ROOT" ] && [ -f "$USB_ROOT/runtime/mac/node-darwin-x64.tar.gz" ]; then
+      TAR_SRC="$USB_ROOT/runtime/mac/node-darwin-x64.tar.gz"
+      echo "${C_GREEN}  [+] Found pre-bundled Intel x64 Node.js 20 tarball on USB! Extracting...${C_RESET}"
+    else
+      TAR_SRC="/tmp/qbranch-node-v20.20.2-darwin-${NODE_ARCH}.tar.gz"
+      local NODE_URL="https://nodejs.org/dist/v20.20.2/node-v20.20.2-darwin-${NODE_ARCH}.tar.gz"
+      echo "${C_CYAN}  [*] Downloading Node.js v20.20.2 (${NODE_ARCH}) from nodejs.org...${C_RESET}"
+      curl -fL "$NODE_URL" -o "$TAR_SRC" || {
+        echo "${C_RED}  [!] Failed to download Node.js.${C_RESET}"
+        return 1
+      }
+    fi
   fi
 
   rm -rf "$MAC_HOME/runtime/node"
@@ -114,12 +167,13 @@ install_node_runtime() {
   tar -xzf "$TAR_SRC" -C "$MAC_HOME/runtime/node" --strip-components=1 || return 1
   chmod +x "$MAC_HOME/runtime/node/bin/"* 2>/dev/null || true
   xattr -dr com.apple.quarantine "$MAC_HOME/runtime/node" 2>/dev/null || true
+  printf '%s' "$RUNTIME_TIER" > "$tier_file"
 
   if "$MAC_HOME/runtime/node/bin/node" -v >/dev/null 2>&1; then
     echo "${C_GREEN}  [+] Node.js ready: $("$MAC_HOME/runtime/node/bin/node" -v)${C_RESET}"
     return 0
   fi
-  echo "${C_RED}  [!] Node binary failed self-check on macOS ${MAC_VER}.${C_RESET}"
+  echo "${C_RED}  [!] Node binary failed self-check on OS X ${MAC_VER}.${C_RESET}"
   return 1
 }
 
@@ -127,31 +181,37 @@ rewrite_mac_paths() {
   local node_bin="$MAC_HOME/runtime/node/bin/node"
   [ -x "$node_bin" ] || return 0
   "$node_bin" -e '
-    const fs = require("fs");
-    const path = require("path");
-    const macHome = process.env.QBRANCH_MAC_HOME;
-    const nodeBin = path.join(macHome, "runtime", "node", "bin", "node");
-    const jevCli = path.join(macHome, "runtime", "jev-use", "node_modules", "jev-use", "dist", "cli.js");
-    const hasJev = fs.existsSync(jevCli);
+    var fs = require("fs");
+    var path = require("path");
+    var macHome = process.env.QBRANCH_MAC_HOME;
+    var nodeBin = path.join(macHome, "runtime", "node", "bin", "node");
+    var jevCli = path.join(macHome, "runtime", "jev-use", "node_modules", "jev-use", "dist", "cli.js");
+    var hasJev = fs.existsSync(jevCli);
 
-    const sPath = path.join(macHome, "config", "claude", "settings.json");
-    let settings = { env: {}, permissions: {} };
+    function mkdirp(d) {
+      if (fs.existsSync(d)) return;
+      try { fs.mkdirSync(d, { recursive: true }); }
+      catch (e) { mkdirp(path.dirname(d)); try { fs.mkdirSync(d); } catch (e2) {} }
+    }
+
+    var sPath = path.join(macHome, "config", "claude", "settings.json");
+    var settings = { env: {}, permissions: {} };
     if (fs.existsSync(sPath)) {
       try { settings = JSON.parse(fs.readFileSync(sPath, "utf8")); } catch (e) {}
     }
     settings.env = settings.env || {};
-    const apiKey = settings.env.TYPESAFE_API_KEY || settings.env.ANTHROPIC_AUTH_TOKEN || "";
-    const rawBase = settings.env.TYPESAFE_BASE_URL || settings.env.ANTHROPIC_BASE_URL || "https://api.experientiallabs.ai";
-    const baseOrigin = rawBase.replace(/\/v1\/?$/, "").replace(/\/+$/, "");
-    const primary = settings.env.ANTHROPIC_MODEL || "gpt-6-luna";
-    const fast = settings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL || "deepseek-v4.1-flash-1017";
+    var apiKey = settings.env.TYPESAFE_API_KEY || settings.env.ANTHROPIC_AUTH_TOKEN || "";
+    var rawBase = settings.env.TYPESAFE_BASE_URL || settings.env.ANTHROPIC_BASE_URL || "https://api.experientiallabs.ai";
+    var baseOrigin = rawBase.replace(/\/v1\/?$/, "").replace(/\/+$/, "");
+    var primary = settings.env.ANTHROPIC_MODEL || "gpt-6-luna";
+    var fast = settings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL || "deepseek-v4.1-flash-1017";
     if (apiKey) settings.env.TYPESAFE_API_KEY = apiKey;
     settings.env.TYPESAFE_BASE_URL = baseOrigin;
-    fs.mkdirSync(path.dirname(sPath), { recursive: true });
+    mkdirp(path.dirname(sPath));
     fs.writeFileSync(sPath, JSON.stringify(settings, null, 2), "utf8");
 
-    const cjPath = path.join(macHome, "config", "claude", ".claude.json");
-    let cj = {};
+    var cjPath = path.join(macHome, "config", "claude", ".claude.json");
+    var cj = {};
     if (fs.existsSync(cjPath)) {
       try { cj = JSON.parse(fs.readFileSync(cjPath, "utf8")); } catch (e) {}
     }
@@ -164,51 +224,51 @@ rewrite_mac_paths() {
     };
     fs.writeFileSync(cjPath, JSON.stringify(cj, null, 2), "utf8");
 
-    const hDir = path.join(macHome, "config", "hermes");
-    fs.mkdirSync(hDir, { recursive: true });
-    const hCfgPath = path.join(hDir, "config.yaml");
-    let reasoning = "none";
+    var hDir = path.join(macHome, "config", "hermes");
+    mkdirp(hDir);
+    var hCfgPath = path.join(hDir, "config.yaml");
+    var reasoning = "none";
     if (fs.existsSync(hCfgPath)) {
-      const oldRaw = fs.readFileSync(hCfgPath, "utf8");
-      const rm = oldRaw.match(/reasoning_effort:\s*"([^"]+)"/);
+      var oldRaw = fs.readFileSync(hCfgPath, "utf8");
+      var rm = oldRaw.match(/reasoning_effort:\s*"([^"]+)"/);
       if (rm) reasoning = rm[1];
     }
-    const hermesYaml = [
+    var hermesYaml = [
       "# 007 Q-Branch macOS Configuration",
       "_config_version: 53",
       "model:",
-      `  default: "${primary}"`,
-      `  provider: "custom"`,
-      `  base_url: "${baseOrigin}/v1"`,
-      `  api_key: "${apiKey}"`,
+      "  default: \"" + primary + "\"",
+      "  provider: \"custom\"",
+      "  base_url: \"" + baseOrigin + "/v1\"",
+      "  api_key: \"" + apiKey + "\"",
       "agent:",
-      `  reasoning_effort: "${reasoning}"`,
+      "  reasoning_effort: \"" + reasoning + "\"",
       "delegation:",
-      `  model: "${fast}"`,
+      "  model: \"" + fast + "\"",
       "  max_iterations: 250",
       "mcp_servers:",
       "  jev:",
-      `    command: "${hasJev ? nodeBin : "npx"}"`,
-      `    args: ${hasJev ? JSON.stringify([jevCli, "serve"]) : JSON.stringify(["-y", "jev-use@0.8.0", "serve"])}`,
+      "    command: \"" + (hasJev ? nodeBin : "npx") + "\"",
+      "    args: " + (hasJev ? JSON.stringify([jevCli, "serve"]) : JSON.stringify(["-y", "jev-use@0.8.0", "serve"])),
       "    env:",
-      `      TYPESAFE_API_KEY: "${apiKey}"`,
-      `      TYPESAFE_BASE_URL: "${baseOrigin}"`,
+      "      TYPESAFE_API_KEY: \"" + apiKey + "\"",
+      "      TYPESAFE_BASE_URL: \"" + baseOrigin + "\"",
       "runtime:",
       "  nofile_soft_limit: 4096",
       "tools:",
       "  tool_search:",
-      `    enabled: "off"`,
+      "    enabled: \"off\"",
       ""
     ].join("\n");
     fs.writeFileSync(hCfgPath, hermesYaml, "utf8");
 
-    const hermesEnv = [
+    var hermesEnv = [
       "# 007 Q-Branch macOS Environment",
-      `OPENAI_API_KEY=${apiKey}`,
-      `OPENAI_BASE_URL=${baseOrigin}/v1`,
-      `CUSTOM_API_KEY=${apiKey}`,
-      `TYPESAFE_API_KEY=${apiKey}`,
-      `TYPESAFE_BASE_URL=${baseOrigin}`,
+      "OPENAI_API_KEY=" + apiKey,
+      "OPENAI_BASE_URL=" + baseOrigin + "/v1",
+      "CUSTOM_API_KEY=" + apiKey,
+      "TYPESAFE_API_KEY=" + apiKey,
+      "TYPESAFE_BASE_URL=" + baseOrigin,
       ""
     ].join("\n");
     fs.writeFileSync(path.join(hDir, ".env"), hermesEnv, "utf8");
@@ -223,6 +283,7 @@ sync_from_usb() {
   echo "${C_CYAN}[*] Syncing scripts, skills & configs from USB -> ~/Q-Branch-Mac...${C_RESET}"
   [ -f "$USB_ROOT/qbranch.mjs" ] && cp -f "$USB_ROOT/qbranch.mjs" "$MAC_HOME/qbranch.mjs"
   [ -f "$USB_ROOT/qbranch-agent.mjs" ] && cp -f "$USB_ROOT/qbranch-agent.mjs" "$MAC_HOME/qbranch-agent.mjs"
+  [ -f "$USB_ROOT/qbranch-legacy.cjs" ] && cp -f "$USB_ROOT/qbranch-legacy.cjs" "$MAC_HOME/qbranch-legacy.cjs"
   [ -f "$USB_ROOT/Launch Agent (Mac).command" ] && cp -f "$USB_ROOT/Launch Agent (Mac).command" "$MAC_HOME/Launch Agent (Mac).command" && chmod +x "$MAC_HOME/Launch Agent (Mac).command" 2>/dev/null || true
 
   if [ -d "$USB_ROOT/runtime/jev-use/node_modules" ] && [ ! -f "$MAC_HOME/runtime/jev-use/node_modules/jev-use/dist/cli.js" ]; then
@@ -280,12 +341,31 @@ install_node_runtime
 sync_from_usb 0
 install_desktop_shortcut
 
-QBRANCH_SCRIPT="$MAC_HOME/qbranch.mjs"
-AGENT_SCRIPT="$MAC_HOME/qbranch-agent.mjs"
 NODE_BIN="$MAC_HOME/runtime/node/bin/node"
 if [ ! -x "$NODE_BIN" ]; then
   NODE_BIN="$(command -v node 2>/dev/null || echo node)"
 fi
+
+if [ "$IS_LEGACY_MAC" -eq 1 ]; then
+  QBRANCH_SCRIPT="$MAC_HOME/qbranch-legacy.cjs"
+else
+  QBRANCH_SCRIPT="$MAC_HOME/qbranch.mjs"
+fi
+AGENT_SCRIPT="$MAC_HOME/qbranch-agent.mjs"
+
+run_qbranch_cmd() {
+  local subcmd="$1"
+  shift || true
+  (cd "$WORK_DIR" && "$NODE_BIN" "$QBRANCH_SCRIPT" "$subcmd" "$@")
+}
+
+run_direct_agent() {
+  if [ "$IS_LEGACY_MAC" -eq 1 ]; then
+    (cd "$WORK_DIR" && "$NODE_BIN" "$MAC_HOME/qbranch-legacy.cjs" agent "$@")
+  else
+    (cd "$WORK_DIR" && "$NODE_BIN" "$AGENT_SCRIPT" "$@")
+  fi
+}
 
 find_hermes_bin() {
   if [ -x "$HOME/.local/bin/hermes" ]; then
@@ -301,13 +381,24 @@ find_hermes_bin() {
 
 install_hermes_mac() {
   echo ""
+  if [ "$CAN_HERMES" -eq 0 ]; then
+    echo "${C_GOLD}[!] Native Hermes Agent requires macOS 10.12+ (Sierra / Catalina / Ventura).${C_RESET}"
+    echo "${C_WHITE}    This MacBook is running OS X ${MAC_VER} (Mountain Lion):${C_RESET}"
+    echo "${C_GRAY}    - System curl on 10.8 only speaks TLS 1.0 (rejected by modern HTTPS servers)${C_RESET}"
+    echo "${C_GRAY}    - Hermes Python 3.14 / uv binaries require macOS 10.12+${C_RESET}"
+    echo ""
+    echo "${C_GREEN}[+] Good news! Q-Branch Direct Agent [1] / [2] runs NATIVELY on OS X ${MAC_VER}${C_RESET}"
+    echo "${C_WHITE}    with Node v10.24.1 (OpenSSL TLS 1.3), full tool calling, Jev, and all 45+ skills!${C_RESET}"
+    echo "${C_GRAY}    (Tip: If you ever upgrade this i7 MacBook via OpenCore Legacy Patcher to macOS 13+,${C_RESET}"
+    echo "${C_GRAY}     both Hermes Agent AND Claude Code will unlock automatically!)${C_RESET}"
+    echo ""
+    read -r -p "Press Enter to return to menu..." _
+    return 0
+  fi
+
   echo "${C_CYAN}==============================================================================${C_RESET}"
   echo "${C_GOLD} 007 Q-BRANCH : INSTALL / REPAIR HERMES AGENT ON MACOS ${MAC_VER} (${MAC_ARCH})${C_RESET}"
   echo "${C_CYAN}==============================================================================${C_RESET}"
-  echo "${C_GRAY}Running official Nous Research Hermes installer (Python 3.14 standalone)...${C_RESET}"
-  echo "${C_GRAY}Note: If any compiled wheel rejects macOS ${MAC_VER}, [3] Q-Branch Direct Agent${C_RESET}"
-  echo "${C_GRAY}      is always available right away with zero external dependencies.${C_RESET}"
-  echo ""
   export MACOSX_DEPLOYMENT_TARGET="${MAC_MAJOR}.${MAC_MINOR}"
   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
   local rc=$?
@@ -319,7 +410,7 @@ install_hermes_mac() {
   else
     echo ""
     echo "${C_GOLD}[!] Hermes installer exited with code ${rc}.${C_RESET}"
-    echo "${C_WHITE}Tip: You can still use [3] Q-Branch Direct Agent immediately on macOS ${MAC_VER}!${C_RESET}"
+    echo "${C_WHITE}Tip: You can still use Q-Branch Direct Agent immediately!${C_RESET}"
   fi
   echo ""
   read -r -p "Press Enter to return to menu..." _
@@ -327,12 +418,17 @@ install_hermes_mac() {
 
 run_hermes_with_args() {
   local extra_args="${1:-}"
+  if [ "$CAN_HERMES" -eq 0 ]; then
+    install_hermes_mac
+    return 0
+  fi
   local hbin
   hbin="$(find_hermes_bin)"
   if [ -z "$hbin" ]; then
     echo ""
     echo "${C_GOLD}[!] Hermes Agent is not installed on this Mac yet.${C_RESET}"
-    read -r -p "Install Hermes now? [Y/n] (or press n to use [3] Direct Agent): " ans
+    read -r -p "Install Hermes now? [Y/n]: " ans
+    local ans_low
     ans_low="$(echo "${ans:-y}" | tr '[:upper:]' '[:lower:]')"
     if [ "$ans_low" = "y" ] || [ "$ans_low" = "yes" ]; then
       install_hermes_mac
@@ -348,41 +444,90 @@ run_hermes_with_args() {
 }
 
 pick_folder_mac() {
-  clear
-  echo "${C_CYAN}==============================================================================${C_RESET}"
-  echo "${C_GOLD}              007 Q-BRANCH : TARGET FOLDER SELECTION (MACOS)                  ${C_RESET}"
-  echo "${C_CYAN}==============================================================================${C_RESET}"
-  echo "  Current Operational Folder : ${C_WHITE}${WORK_DIR}${C_RESET}"
-  echo ""
-  echo "  ${C_GREEN}[1]${C_RESET} Browse with macOS Finder Dialog (GUI)"
-  echo "  ${C_CYAN}[2]${C_RESET} Type / Drag-and-Drop Folder Path"
-  echo "  ${C_RED}[0]${C_RESET} Cancel"
-  echo ""
-  read -r -p "Select option [1-2, 0]: " pchoice
-  if [ "$pchoice" = "1" ]; then
-    local picked
-    picked="$(osascript -e 'POSIX path of (choose folder with prompt "007 Q-Branch: Select Project Folder")' 2>/dev/null || true)"
-    if [ -n "$picked" ] && [ -d "$picked" ]; then
-      WORK_DIR="${picked%/}"
-      echo "${C_GREEN}[+] Folder locked: ${WORK_DIR}${C_RESET}"
-      sleep 1
-    fi
-  elif [ "$pchoice" = "2" ]; then
-    read -r -p "Paste or drag folder path: " mpath
-    mpath="${mpath%\"}"
-    mpath="${mpath#\"}"
-    mpath="${mpath%\'}"
-    mpath="${mpath#\'}"
-    mpath="${mpath/#\~/$HOME}"
-    if [ -d "$mpath" ]; then
-      WORK_DIR="$(cd "$mpath" && pwd)"
-      echo "${C_GREEN}[+] Folder locked: ${WORK_DIR}${C_RESET}"
-      sleep 1
-    else
-      echo "${C_RED}[!] Folder not found: ${mpath}${C_RESET}"
-      sleep 2
-    fi
-  fi
+  while true; do
+    clear
+    echo "${C_CYAN}==============================================================================${C_RESET}"
+    echo "${C_GOLD}              007 Q-BRANCH : TARGET FOLDER SELECTION (MACOS)                  ${C_RESET}"
+    echo "${C_CYAN}==============================================================================${C_RESET}"
+    echo "  Current Operational Folder : ${C_WHITE}${WORK_DIR}${C_RESET}"
+    echo ""
+    echo "  ${C_GREEN}[1]${C_RESET} Browse with macOS Finder Dialog (GUI)"
+    echo "  ${C_CYAN}[2]${C_RESET} Type or Drag-and-Drop Folder into Terminal"
+    echo "  ${C_GOLD}[3]${C_RESET} Quick Jump: Desktop  (${HOME}/Desktop)"
+    echo "  ${C_GOLD}[4]${C_RESET} Quick Jump: Home     (${HOME})"
+    echo "  ${C_RED}[0]${C_RESET} Return to Main Menu"
+    echo ""
+    read -r -p "Select option [1-4, 0]: " pchoice
+    case "$pchoice" in
+      0|q|Q|"")
+        return 0
+        ;;
+      1)
+        echo "${C_CYAN}[*] Opening macOS Finder folder picker...${C_RESET}"
+        local picked=""
+        local osa_rc=0
+        picked="$(osascript 2>&1 <<'EOF'
+tell application "Finder"
+  activate
+  set chosenFolder to choose folder with prompt "007 Q-Branch: Select Project Folder"
+  return POSIX path of chosenFolder
+end tell
+EOF
+)" || osa_rc=$?
+        osascript -e 'tell application "Terminal" to activate' >/dev/null 2>&1 || true
+        if [ "$osa_rc" -eq 0 ] && [ -n "$picked" ] && [ -d "$picked" ]; then
+          WORK_DIR="${picked%/}"
+          [ -z "$WORK_DIR" ] && WORK_DIR="/"
+          echo "${C_GREEN}[+] Operational folder locked: ${WORK_DIR}${C_RESET}"
+          sleep 1
+          return 0
+        elif echo "$picked" | grep -q -- "-128"; then
+          echo "${C_GRAY}[*] Finder picker cancelled.${C_RESET}"
+          sleep 1
+        else
+          echo "${C_GOLD}[!] Finder dialog note: ${picked}${C_RESET}"
+          echo "${C_WHITE}    Use [2] to drag any folder from Finder directly into this window!${C_RESET}"
+          read -r -p "Press Enter to continue..." _
+        fi
+        ;;
+      2)
+        echo "${C_GRAY}Tip: You can drag a folder from Finder straight into this Terminal window, then press Enter.${C_RESET}"
+        read -r -p "Folder path: " mpath
+        # Trim leading/trailing spaces & quotes, expand ~, unescape Finder drag-and-drop '\ ' spaces
+        mpath="$(printf '%s' "$mpath" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//; s/^'\''//; s/'\''$//; s/\\ / /g')"
+        case "$mpath" in
+          "~"*) mpath="${HOME}${mpath#\~}" ;;
+        esac
+        if [ -n "$mpath" ] && [ -d "$mpath" ]; then
+          WORK_DIR="$(cd "$mpath" && pwd)"
+          echo "${C_GREEN}[+] Operational folder locked: ${WORK_DIR}${C_RESET}"
+          sleep 1
+          return 0
+        else
+          echo "${C_RED}[!] Folder not found: ${mpath}${C_RESET}"
+          read -r -p "Press Enter to try again..." _
+        fi
+        ;;
+      3)
+        if [ -d "$HOME/Desktop" ]; then
+          WORK_DIR="$HOME/Desktop"
+          echo "${C_GREEN}[+] Operational folder locked: ${WORK_DIR}${C_RESET}"
+          sleep 1
+          return 0
+        fi
+        ;;
+      4)
+        WORK_DIR="$HOME"
+        echo "${C_GREEN}[+] Operational folder locked: ${WORK_DIR}${C_RESET}"
+        sleep 1
+        return 0
+        ;;
+      *)
+        echo "${C_RED}Invalid option.${C_RESET}"
+        sleep 1
+        ;;
+    esac
+  done
 }
 
 # ------------------------------------------------------------------------------
@@ -396,7 +541,7 @@ while true; do
   Q_JEV_STATUS="CHECKING"
   Q_JEV_GATE="OFF"
 
-  if [ -f "$QBRANCH_SCRIPT" ]; then
+  if [ -f "$QBRANCH_SCRIPT" ] && "$NODE_BIN" -v >/dev/null 2>&1; then
     while IFS='=' read -r k v; do
       case "$k" in
         Q_PRIMARY) Q_PRIMARY="$v" ;;
@@ -407,8 +552,11 @@ while true; do
     done < <("$NODE_BIN" "$QBRANCH_SCRIPT" env-summary 2>/dev/null || true)
   fi
 
+  NODE_VER_STR="$("$NODE_BIN" -v 2>/dev/null || echo 'missing')"
   HERMES_BIN="$(find_hermes_bin)"
-  if [ -n "$HERMES_BIN" ]; then
+  if [ "$CAN_HERMES" -eq 0 ]; then
+    HERMES_STATUS="${C_GRAY}N/A on OS X ${MAC_VER} (Direct Agent active instead!)${C_RESET}"
+  elif [ -n "$HERMES_BIN" ]; then
     HERMES_STATUS="${C_GREEN}INSTALLED${C_RESET}"
   else
     HERMES_STATUS="${C_GOLD}NOT INSTALLED (Press [I] to install)${C_RESET}"
@@ -425,40 +573,56 @@ while true; do
   echo "${C_GOLD}     / _ \\ / _ \\|___  |   / _ \\      | _ ) | _ \\  /_\\ | \\| |/ __|| || | ${C_RESET}"
   echo "${C_GOLD}    | (_) | (_) |  / /   | (_) | --- | _ \\ |   / / _ \\| .\` | (__ | __ | ${C_RESET}"
   echo "${C_GOLD}     \\___/ \\___/  /_/     \\__\\_|     |___/ |_|_\\/_/ \\_\\_|\\_|\\___||_||_| ${C_RESET}"
-  echo "${C_MAGENTA}             AI AGENT COMMAND CENTER | MACOS PORTABLE EDITION                 ${C_RESET}"
+  if [ "$IS_LEGACY_MAC" -eq 1 ]; then
+    echo "${C_MAGENTA}       AI AGENT COMMAND CENTER | OS X LEGACY EDITION (DARK MODE)              ${C_RESET}"
+  else
+    echo "${C_MAGENTA}       AI AGENT COMMAND CENTER | MACOS PORTABLE EDITION (DARK MODE)           ${C_RESET}"
+  fi
   echo "${C_CYAN}==============================================================================${C_RESET}"
-  echo "  ${C_GRAY}MAC HARDWARE       :${C_RESET} ${C_WHITE}macOS ${MAC_VER} (${MAC_ARCH}) | Node $("$NODE_BIN" -v 2>/dev/null || echo 'missing')${C_RESET}"
+  echo "  ${C_GRAY}MAC HARDWARE       :${C_RESET} ${C_WHITE}OS X ${MAC_VER} (${MAC_ARCH}) | Node ${NODE_VER_STR} (TLS 1.3)${C_RESET}"
   echo "  ${C_GRAY}STORAGE / SYNC     :${C_RESET} ${C_GREEN}${USB_MODE}${C_RESET}"
   echo "  ${C_GRAY}OPERATIONAL FOLDER :${C_RESET} ${C_WHITE}${WORK_DIR}${C_RESET}"
   echo "  ${C_GRAY}ACTIVE TEAM        :${C_RESET} ${C_GOLD}${Q_PRIMARY}${C_RESET} + ${C_CYAN}${Q_FAST}${C_RESET}"
-  echo "  ${C_GRAY}JEV INTERVENTION   :${C_RESET} ${C_GREEN}${Q_JEV_STATUS}${C_RESET} ${C_GRAY}[PreToolUse Gate: ${C_GOLD}${Q_JEV_GATE}${C_GRAY}]${C_RESET}"
+  echo "  ${C_GRAY}JEV INTERVENTION   :${C_RESET} ${C_GREEN}${Q_JEV_STATUS}${C_RESET} ${C_GRAY}[/v1/systemone ready]${C_RESET}"
   echo "  ${C_GRAY}HERMES ENGINE      :${C_RESET} ${HERMES_STATUS}"
   echo "${C_CYAN}==============================================================================${C_RESET}"
   echo ""
-  echo "  ${C_GREEN}[1]${C_RESET} ${C_WHITE}Hermes Agent${C_RESET}            ${C_GRAY}- Synced Split [${Q_PRIMARY} + Subagent ${Q_FAST}]${C_RESET}"
-  echo "  ${C_GREEN}[2]${C_RESET} ${C_WHITE}Hermes Agent (TUI)${C_RESET}      ${C_GRAY}- Visual Dashboard Interface [${Q_PRIMARY}]${C_RESET}"
-  echo "  ${C_GREEN}[3]${C_RESET} ${C_WHITE}Q-Branch Direct Agent${C_RESET}   ${C_GOLD}[Catalina-Proof]${C_GRAY} Zero-install coding agent + tools${C_RESET}"
-  echo "  ${C_GOLD}[4]${C_RESET} ${C_WHITE}Q-Branch Direct (YOLO)${C_RESET}  ${C_GRAY}- Auto-approve shell & file edits${C_RESET}"
-  echo "  ${C_GOLD}[5]${C_RESET} ${C_WHITE}Hermes Agent (YOLO)${C_RESET}     ${C_GRAY}- Auto-approve Hermes commands${C_RESET}"
-  echo "  ${C_GRAY}[6] Claude Code${C_RESET}             ${CLAUDE_LABEL}"
+  if [ "$IS_LEGACY_MAC" -eq 1 ]; then
+    echo "  ${C_GREEN}[1]${C_RESET} ${C_WHITE}Q-Branch Direct Agent${C_RESET}   ${C_GOLD}[OS X ${MAC_VER} Native]${C_GRAY} Coding agent + shell/files/Jev${C_RESET}"
+    echo "  ${C_GOLD}[2]${C_RESET} ${C_WHITE}Q-Branch Direct (YOLO)${C_RESET}  ${C_GRAY}- Auto-approve shell & file edits${C_RESET}"
+    echo "  ${C_GRAY}[3] Hermes Agent${C_RESET}            ${C_GRAY}- Requires macOS 10.12+ (Detected ${MAC_VER})${C_RESET}"
+    echo "  ${C_GRAY}[6] Claude Code${C_RESET}             ${CLAUDE_LABEL}"
+    DEFAULT_CHOICE="1"
+  else
+    echo "  ${C_GREEN}[1]${C_RESET} ${C_WHITE}Hermes Agent${C_RESET}            ${C_GRAY}- Synced Split [${Q_PRIMARY} + Subagent ${Q_FAST}]${C_RESET}"
+    echo "  ${C_GREEN}[2]${C_RESET} ${C_WHITE}Hermes Agent (TUI)${C_RESET}      ${C_GRAY}- Visual Dashboard Interface [${Q_PRIMARY}]${C_RESET}"
+    echo "  ${C_GREEN}[3]${C_RESET} ${C_WHITE}Q-Branch Direct Agent${C_RESET}   ${C_GOLD}[Zero-Install]${C_GRAY} Native coding agent + tools${C_RESET}"
+    echo "  ${C_GOLD}[4]${C_RESET} ${C_WHITE}Q-Branch Direct (YOLO)${C_RESET}  ${C_GRAY}- Auto-approve shell & file edits${C_RESET}"
+    echo "  ${C_GOLD}[5]${C_RESET} ${C_WHITE}Hermes Agent (YOLO)${C_RESET}     ${C_GRAY}- Auto-approve Hermes commands${C_RESET}"
+    echo "  ${C_GRAY}[6] Claude Code${C_RESET}             ${CLAUDE_LABEL}"
+    DEFAULT_CHOICE="3"
+  fi
   echo ""
   echo "  ${C_CYAN}--- Q-BRANCH ARSENAL & MAC TOOLS ---${C_RESET}"
-  echo "  ${C_CYAN}[W]${C_RESET} ${C_WHITE}Select Project Folder${C_RESET}   ${C_GRAY}- Native macOS Finder Picker (or drag path)${C_RESET}"
-  echo "  ${C_CYAN}[I]${C_RESET} ${C_WHITE}Install/Repair Hermes${C_RESET}   ${C_GRAY}- Setup Hermes Agent + Jev MCP on this Mac${C_RESET}"
-  echo "  ${C_MAGENTA}[P]${C_RESET} ${C_WHITE}Mission Loadouts${C_RESET}        ${C_GRAY}- 1-Click Strike Team Skills Swap${C_RESET}"
+  echo "  ${C_CYAN}[W]${C_RESET} ${C_WHITE}Select Project Folder${C_RESET}   ${C_GRAY}- Finder GUI Picker or Drag-and-Drop${C_RESET}"
+  if [ "$CAN_HERMES" -eq 1 ]; then
+    echo "  ${C_CYAN}[I]${C_RESET} ${C_WHITE}Install/Repair Hermes${C_RESET}   ${C_GRAY}- Setup Hermes Agent + Jev MCP on this Mac${C_RESET}"
+    echo "  ${C_MAGENTA}[P]${C_RESET} ${C_WHITE}Mission Loadouts${C_RESET}        ${C_GRAY}- 1-Click Strike Team Skills Swap${C_RESET}"
+    echo "  ${C_MAGENTA}[H]${C_RESET} ${C_WHITE}Hermes Modes & Split${C_RESET}    ${C_GRAY}- Subagent model, reasoning, resume, worktree${C_RESET}"
+  fi
   echo "  ${C_MAGENTA}[K]${C_RESET} ${C_WHITE}Skills Arsenal${C_RESET}          ${C_GRAY}- Browse & deploy 45+ Q-Branch skills${C_RESET}"
   echo "  ${C_MAGENTA}[M]${C_RESET} ${C_WHITE}Online Model Browser${C_RESET}    ${C_GRAY}- Live Zero-Cost & Discounted gateway models${C_RESET}"
-  echo "  ${C_MAGENTA}[H]${C_RESET} ${C_WHITE}Hermes Modes & Split${C_RESET}    ${C_GRAY}- Subagent model, reasoning, resume, worktree${C_RESET}"
-  echo "  ${C_MAGENTA}[J]${C_RESET} ${C_WHITE}Jev Intervention & Gate${C_RESET} ${C_GRAY}- Live /v1/systemone latency test & wiring${C_RESET}"
+  echo "  ${C_MAGENTA}[J]${C_RESET} ${C_WHITE}Jev Intervention & Test${C_RESET} ${C_GRAY}- Live /v1/systemone latency test (jev & clef)${C_RESET}"
   echo "  ${C_CYAN}[L]${C_RESET} ${C_WHITE}Local Server Audit${C_RESET}      ${C_GRAY}- Scan Mac local servers (lsof), LAN & CORS${C_RESET}"
   echo "  ${C_MAGENTA}[S]${C_RESET} ${C_WHITE}Gateway Settings${C_RESET}        ${C_GRAY}- View/Update API Key & Gateway URL${C_RESET}"
   echo "  ${C_GOLD}[R]${C_RESET} ${C_WHITE}Re-Sync from USB Drive${C_RESET}  ${C_GRAY}- Pull latest keys, skills & scripts from USB${C_RESET}"
+  echo "  ${C_CYAN}[D]${C_RESET} ${C_WHITE}Apply Dark Mode Theme${C_RESET}   ${C_GRAY}- Switch Terminal window to 007 Dark Pro theme${C_RESET}"
   echo ""
   echo "  ${C_RED}[Q]${C_RESET} ${C_WHITE}Q-Branch Signoff${C_RESET}        ${C_GRAY}- Exit${C_RESET}"
   echo "${C_CYAN}==============================================================================${C_RESET}"
 
-  read -r -p "${C_BOLD}Select operation [1-6, W, I, P, K, M, H, J, L, S, R, Q] (Default 3): ${C_RESET}" choice
-  choice="$(echo "${choice:-3}" | tr '[:upper:]' '[:lower:]')"
+  read -r -p "${C_BOLD}Select operation (Default ${DEFAULT_CHOICE}): ${C_RESET}" choice
+  choice="$(echo "${choice:-$DEFAULT_CHOICE}" | tr '[:upper:]' '[:lower:]')"
 
   case "$choice" in
     q|exit)
@@ -468,20 +632,38 @@ while true; do
       exit 0
       ;;
     1)
-      run_hermes_with_args ""
+      if [ "$IS_LEGACY_MAC" -eq 1 ]; then
+        echo ""
+        run_direct_agent
+        echo ""
+        read -r -p "Press Enter to return to Q-Branch..." _
+      else
+        run_hermes_with_args ""
+      fi
       ;;
     2)
-      run_hermes_with_args "--tui"
+      if [ "$IS_LEGACY_MAC" -eq 1 ]; then
+        echo ""
+        run_direct_agent --yolo
+        echo ""
+        read -r -p "Press Enter to return to Q-Branch..." _
+      else
+        run_hermes_with_args "--tui"
+      fi
       ;;
     3)
-      echo ""
-      (cd "$WORK_DIR" && "$NODE_BIN" "$AGENT_SCRIPT")
-      echo ""
-      read -r -p "Press Enter to return to Q-Branch..." _
+      if [ "$IS_LEGACY_MAC" -eq 1 ]; then
+        install_hermes_mac
+      else
+        echo ""
+        run_direct_agent
+        echo ""
+        read -r -p "Press Enter to return to Q-Branch..." _
+      fi
       ;;
     4)
       echo ""
-      (cd "$WORK_DIR" && "$NODE_BIN" "$AGENT_SCRIPT" --yolo)
+      run_direct_agent --yolo
       echo ""
       read -r -p "Press Enter to return to Q-Branch..." _
       ;;
@@ -491,11 +673,9 @@ while true; do
     6)
       if [ "$CAN_CLAUDE" -eq 0 ]; then
         echo ""
-        echo "${C_GOLD}[!] Claude Code requires macOS 13.0 (Ventura) or newer (this Mac is ${MAC_VER}).${C_RESET}"
-        echo "${C_WHITE}Options on your Intel i7 MacBook Pro:${C_RESET}"
-        echo "  1. Use ${C_GREEN}[3] Q-Branch Direct Agent${C_RESET} (works right now on Catalina 10.15!)"
-        echo "  2. Use ${C_GREEN}[1] Hermes Agent${C_RESET} (press [I] to install native Python 3.14 Hermes)"
-        echo "  3. Optional: Upgrade via OpenCore Legacy Patcher (macOS 13/14) if you want Claude Code later."
+        echo "${C_GOLD}[!] Claude Code requires macOS 13.0 (Ventura) or newer (this Mac is OS X ${MAC_VER}).${C_RESET}"
+        echo "${C_WHITE}    Use [1] Q-Branch Direct Agent right now on OS X ${MAC_VER}!${C_RESET}"
+        echo "${C_GRAY}    (Or upgrade via OpenCore Legacy Patcher if you want native Claude Code later.)${C_RESET}"
         echo ""
         read -r -p "Press Enter to return to menu..." _
       else
@@ -511,40 +691,51 @@ while true; do
     w)
       pick_folder_mac
       ;;
+    d)
+      apply_dark_mode
+      ;;
     i)
       install_hermes_mac
       ;;
     p)
-      (cd "$WORK_DIR" && "$NODE_BIN" "$QBRANCH_SCRIPT" profiles)
+      if [ "$IS_LEGACY_MAC" -eq 1 ]; then
+        run_qbranch_cmd skills
+      else
+        run_qbranch_cmd profiles
+      fi
       ;;
     k)
-      (cd "$WORK_DIR" && "$NODE_BIN" "$QBRANCH_SCRIPT" skills)
+      run_qbranch_cmd skills
       ;;
     m)
-      (cd "$WORK_DIR" && "$NODE_BIN" "$QBRANCH_SCRIPT" models)
+      run_qbranch_cmd models
       read -r -p "Press Enter to continue..." _
       ;;
     h)
-      NODE_TMP="$("$NODE_BIN" -e "console.log(require('os').tmpdir())" 2>/dev/null || echo "/tmp")"
-      LAUNCH_FILE="${NODE_TMP%/}/qbranch_hermes_launch.txt"
-      rm -f "$LAUNCH_FILE"
-      (cd "$WORK_DIR" && "$NODE_BIN" "$QBRANCH_SCRIPT" hermes-modes)
-      if [ -f "$LAUNCH_FILE" ]; then
-        H_ARGS="$(cat "$LAUNCH_FILE")"
+      if [ "$CAN_HERMES" -eq 0 ]; then
+        install_hermes_mac
+      else
+        NODE_TMP="$("$NODE_BIN" -e "console.log(require('os').tmpdir())" 2>/dev/null || echo "/tmp")"
+        LAUNCH_FILE="${NODE_TMP%/}/qbranch_hermes_launch.txt"
         rm -f "$LAUNCH_FILE"
-        if [ -n "$H_ARGS" ]; then
-          run_hermes_with_args "$H_ARGS"
+        run_qbranch_cmd hermes-modes
+        if [ -f "$LAUNCH_FILE" ]; then
+          H_ARGS="$(cat "$LAUNCH_FILE")"
+          rm -f "$LAUNCH_FILE"
+          if [ -n "$H_ARGS" ]; then
+            run_hermes_with_args "$H_ARGS"
+          fi
         fi
       fi
       ;;
     j)
-      (cd "$WORK_DIR" && "$NODE_BIN" "$QBRANCH_SCRIPT" jev)
+      run_qbranch_cmd jev
       ;;
     l)
-      (cd "$WORK_DIR" && "$NODE_BIN" "$QBRANCH_SCRIPT" local-audit)
+      run_qbranch_cmd local-audit
       ;;
     s)
-      (cd "$WORK_DIR" && "$NODE_BIN" "$QBRANCH_SCRIPT" config)
+      run_qbranch_cmd config
       read -r -p "Press Enter to continue..." _
       ;;
     r)
